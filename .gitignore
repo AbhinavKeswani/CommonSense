@@ -1,0 +1,9 @@
+data/
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+.streamlit/

@@ -1,0 +1,5 @@
+edgartools>=2.0
+pandas>=2.0
+pyarrow>=14.0
+streamlit>=1.28
+python-dotenv>=1.0
