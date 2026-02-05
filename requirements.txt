@@ -1,4 +1,5 @@
 edgartools>=2.0
+hishel>=0.1.5,<1.0
 pandas>=2.0
 pyarrow>=14.0
 streamlit>=1.28

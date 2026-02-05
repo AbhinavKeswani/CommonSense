@@ -1,4 +1,5 @@
 data/
+.edgar
 .env
 __pycache__/
 *.py[cod]

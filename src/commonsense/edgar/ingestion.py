@@ -1,5 +1,7 @@
 """SEC EDGAR ingestion: fetch via edgartools, normalize to DataFrames, write Parquet."""
 
+from __future__ import annotations
+
 import time
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,14 @@ from commonsense.edgar.models import (
     BALANCE_SHEET_TABLE,
     CASH_FLOW_TABLE,
     INCOME_STATEMENT_TABLE,
+)
+from commonsense.edgar.sec_api import (
+    DEFAULT_FORMS,
+    fetch_submissions,
+    get_periodic_forms_from_submissions,
+    run_sec_api_fallback,
+    ticker_to_cik,
+    _ticker_from_submissions,
 )
 
 
@@ -68,12 +78,42 @@ def run_ingestion(
     tickers_processed = 0
 
     for ticker in tickers:
-        ticker = (ticker or "").strip().upper()
-        if not ticker:
+        raw = (ticker or "").strip()
+        if not raw:
             continue
+        ticker = raw.upper()
+        # Resolve to CIK first (SEC API or numeric input) so we can fetch submissions and derive forms
+        if raw.isdigit():
+            cik_str = str(raw).zfill(10)
+            cik_int: int | None = int(raw)
+        else:
+            cik_str = ticker_to_cik(raw, email)
+            cik_int = int(cik_str) if cik_str else None
+            if not cik_int and not cik_str:
+                # Fallback: try edgartools so we still support tickers not in SEC list
+                try:
+                    company = Company(ticker)
+                    cik_for_edgar = getattr(company, "cik", None)
+                    if cik_for_edgar is not None:
+                        cik_int = int(cik_for_edgar)
+                        cik_str = str(cik_for_edgar).zfill(10)
+                except Exception:
+                    pass
+        if not cik_str and not cik_int:
+            errors.append(f"{ticker}: could not resolve to CIK (ticker not in SEC list?)")
+            continue
+        # Fetch submissions to discover which periodic forms this company actually files
+        sub = fetch_submissions(cik_str or cik_int, email) if (cik_str or cik_int) else None
+        time.sleep(delay_between_companies * 0.5)  # brief delay after submissions
+        forms_to_use = get_periodic_forms_from_submissions(sub) or forms or list(DEFAULT_FORMS)
+        display_ticker = _ticker_from_submissions(sub) or ticker
+        company_dir = output_path / display_ticker
+        company_dir.mkdir(parents=True, exist_ok=True)
+        fallback_done_for_ticker = False
+        cik_for_fallback: int | None = cik_int
         try:
-            company = Company(ticker)
-            for form in forms:
+            company = Company(cik_int if cik_int is not None else ticker)
+            for form in forms_to_use:
                 form = (form or "").strip()
                 if not form:
                     continue
@@ -92,13 +132,13 @@ def run_ingestion(
                             continue
                         filings_count += 1
                         cik = getattr(filing, "cik", None) or ""
-                        company_name = getattr(filing, "company", "") or ticker
+                        company_name = getattr(filing, "company", "") or display_ticker
                         filing_date = getattr(filing, "filing_date", "") or ""
                         accession_no = getattr(filing, "accession_no", "") or getattr(filing, "accession_number", "") or ""
                         period = getattr(filing, "period_of_report", "") or ""
 
                         meta_row = {
-                            "ticker": ticker,
+                            "ticker": display_ticker,
                             "cik": cik,
                             "company": company_name,
                             "form": form,
@@ -110,32 +150,63 @@ def run_ingestion(
 
                         # Safe filename: ticker_form_date (sanitize date and accession)
                         safe_date = (filing_date or "unknown").replace("-", "")[:8]
-                        base_name = f"{ticker}_{form}_{safe_date}"
+                        base_name = f"{display_ticker}_{form}_{safe_date}"
 
-                        # Write metadata
-                        meta_file = output_path / f"{base_name}_meta.parquet"
+                        # Write metadata under company subdir (parquet/ticker/)
+                        meta_file = company_dir / f"{base_name}_meta.parquet"
                         meta_df.to_parquet(meta_file, index=False)
                         files_written.append(str(meta_file))
 
                         income_df, balance_df, cash_df = _safe_financials(filing)
                         if income_df is not None and not income_df.empty:
-                            out_file = output_path / f"{base_name}_{INCOME_STATEMENT_TABLE}.parquet"
+                            out_file = company_dir / f"{base_name}_{INCOME_STATEMENT_TABLE}.parquet"
                             income_df.to_parquet(out_file, index=True)
                             files_written.append(str(out_file))
                         if balance_df is not None and not balance_df.empty:
-                            out_file = output_path / f"{base_name}_{BALANCE_SHEET_TABLE}.parquet"
+                            out_file = company_dir / f"{base_name}_{BALANCE_SHEET_TABLE}.parquet"
                             balance_df.to_parquet(out_file, index=True)
                             files_written.append(str(out_file))
                         if cash_df is not None and not cash_df.empty:
-                            out_file = output_path / f"{base_name}_{CASH_FLOW_TABLE}.parquet"
+                            out_file = company_dir / f"{base_name}_{CASH_FLOW_TABLE}.parquet"
                             cash_df.to_parquet(out_file, index=True)
                             files_written.append(str(out_file))
 
                 except Exception as e:
                     errors.append(f"{ticker} {form}: {e!s}")
+                    # Fallback: use data.sec.gov JSON APIs so we can still operate on the data (no SGML)
+                    if not fallback_done_for_ticker and cik_for_fallback is not None:
+                        try:
+                            fb = run_sec_api_fallback(
+                                cik=cik_for_fallback,
+                                ticker_label=display_ticker,
+                                output_dir=output_path,
+                                user_agent=email,
+                            )
+                            # Fallback writes to output_path/<ticker>/ (ticker resolved from SEC when CIK)
+                            files_written.extend(fb["files_written"])
+                            if fb["errors"]:
+                                errors.extend(fb["errors"])
+                            fallback_done_for_ticker = True
+                        except Exception as fb_e:
+                            errors.append(f"{ticker} (sec_api fallback): {fb_e!s}")
             tickers_processed += 1
         except Exception as e:
             errors.append(f"{ticker}: {e!s}")
+            # If we never entered the form loop (e.g. Company() failed), try fallback by CIK when possible
+            if not fallback_done_for_ticker and cik_for_fallback is not None:
+                try:
+                    fb = run_sec_api_fallback(
+                        cik=cik_for_fallback,
+                        ticker_label=display_ticker,
+                        output_dir=output_path,
+                        user_agent=email,
+                    )
+                    files_written.extend(fb["files_written"])
+                    if fb["errors"]:
+                        errors.extend(fb["errors"])
+                    fallback_done_for_ticker = True
+                except Exception as fb_e:
+                    errors.append(f"{ticker} (sec_api fallback): {fb_e!s}")
         time.sleep(delay_between_companies)
 
     return {
