@@ -1,8 +1,8 @@
 # CommonSense
 
-A private, localized financial intelligence pipeline. CommonSense ingests SEC EDGAR data, runs common-size and flux analysis, and stores results per company so you can feed them into a local LLM (e.g. Ollama) for analyst-style output—all without leaving your machine.
+A private, localized financial intelligence pipeline. CommonSense ingests SEC EDGAR data, runs common-size and flux analysis, extracts MD&A from filings, and stores results per company so you can feed them into a local LLM for analyst-style output—all without leaving your machine.
 
-**Current state (v1):** SEC ingestion, per-ticker storage, common-size and flux analysis (CSV), and a one-command test runner plus a Streamlit dashboard to trigger ingestion from the browser.
+**Current state (v1):** SEC ingestion, per-ticker storage, MD&A extraction (Item 7 / 2 / 5), common-size and flux analysis (CSV), and a one-command test runner plus a Streamlit dashboard to trigger ingestion from the browser. We’re working on modifying the local models now for the analysis step.
 
 ---
 
@@ -21,6 +21,7 @@ A private, localized financial intelligence pipeline. CommonSense ingests SEC ED
   - `{ticker}_sec_facts_balance_sheet.parquet`
   - `{ticker}_sec_facts_cash_flow.parquet`
   (or `_sec_facts_all_concepts.parquet` when fallback buckets do not match.)
+  - **MD&A:** `{base}_mdna.txt` per filing (Management’s Discussion and Analysis: 10-K Item 7, 10-Q Item 2, 20-F Item 5), for use as narrative context alongside the numbers.
 - **Identity:** SEC requires a User-Agent. Set `EDGAR_EMAIL` in `.env`; it’s used as the contact identity (no sign-up). The edgartools cache is pointed at **`data/.edgar`** inside the project by default so you don’t need write access to `~/.edgar`.
 
 ### 2. Common-size and flux analysis
@@ -33,7 +34,7 @@ A private, localized financial intelligence pipeline. CommonSense ingests SEC ED
 - **Output:** Analysis is written as **CSV only** (no Parquet for analysis), under the same company folder:
   - `common_size_income_statement.csv`, `common_size_balance_sheet.csv`, `common_size_cash_flow.csv`
   - `flux_income_statement.csv`, `flux_balance_sheet.csv`, `flux_cash_flow.csv`  
-  These are intended for review and for feeding into an LLM (e.g. Ollama) later.
+  These are intended for review and for feeding into local models (we’re working on that integration).
 
 ### 3. Dashboard and test runner
 
@@ -43,7 +44,7 @@ A private, localized financial intelligence pipeline. CommonSense ingests SEC ED
   python run_ticker.py AAPL
   python run_ticker.py 353278   # CIK for NVO (Novo Nordisk)
   ```
-  This runs ingestion using discovered forms per company (10-K/10-Q for domestic, 20-F for foreign issuers, etc.), then runs analysis for all companies in `DATA_DIR`, and prints where the analysis CSVs were written. Use it to confirm that data is stored correctly after setup.
+  This runs ingestion using discovered forms per company (10-K/10-Q for domestic, 20-F for foreign issuers, etc.), then runs analysis for all companies in `DATA_DIR`, and prints where the analysis CSVs and MD&A files were written. Use it to confirm that data is stored correctly after setup.
 
 ---
 
@@ -60,6 +61,7 @@ CommonSense/
 │   ├── config.py       # EDGAR_EMAIL, DATA_DIR; sets EDGAR_LOCAL_DATA_DIR to data/.edgar
 │   ├── edgar/
 │   │   ├── ingestion.py   # run_ingestion(tickers, forms, ...); CIK + form discovery, edgartools + fallback
+│   │   ├── mdna.py        # MD&A extraction (Item 7/2/5) from filing HTML
 │   │   ├── sec_api.py     # ticker_to_cik, fetch_submissions, get_periodic_forms_from_submissions; data.sec.gov fallback
 │   │   └── models.py      # Table name constants
 │   ├── analysis/
@@ -71,6 +73,7 @@ CommonSense/
 │   └── parquet/         # Output root (DATA_DIR)
 │       └── <ticker>/    # e.g. AAPL/, MSFT/
 │           ├── {ticker}_sec_facts_*.parquet
+│           ├── *_mdna.txt
 │           ├── common_size_*.csv
 │           └── flux_*.csv
 └── Docs/                # Charter, troubleshooting, API overview
@@ -143,5 +146,5 @@ See `.env.example`.
 
 ## Roadmap (beyond v1)
 
-- Supply analysis CSVs (or summarized slices) to Ollama for analyst-style narrative.
+- **Local models:** We’re working on modifying the local models now so that MD&A, common-size, and flux outputs feed into analyst-style narrative.
 - Optional context limiting (e.g. last N periods, material variances only) to keep prompts within model context and runtime reasonable.

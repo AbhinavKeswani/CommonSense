@@ -8,17 +8,23 @@ Usage (from project root, with PYTHONPATH=src or via .venv):
   .venv/bin/python run_ticker.py MSFT
 
 Runs:
-  1. SEC EDGAR ingestion for the ticker (10-K, 10-Q) → facts Parquet under data/parquet/<ticker>/
+  1. SEC EDGAR ingestion for the ticker (10-K, 10-Q, 20-F) → facts Parquet + MD&A .txt under data/parquet/<ticker>/
   2. Common-size and flux analysis → CSV only under data/parquet/<ticker>/
 
-Prints a short summary and the paths to the analysis CSVs so you can confirm data is stored correctly.
+Prints a short summary, paths to analysis CSVs and MD&A files, and Gemini AI analysis (if GEMINI_API_KEY is set) using an editable prompt and the same context.
 """
 
+import os
 import sys
 from pathlib import Path
 
-# Ensure project root and src on path
+# Project root (run_ticker.py lives here)
 _PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Force edgartools cache under project so we always have write permission (avoids ~/.edgar)
+os.environ.setdefault("EDGAR_LOCAL_DATA_DIR", str(_PROJECT_ROOT / "data" / ".edgar"))
+
+# Ensure project root and src on path
 if str(_PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
@@ -28,9 +34,108 @@ try:
 except ImportError:
     pass
 
-from commonsense.config import DATA_DIR, EDGAR_EMAIL
+# Create cache dir so edgartools can write immediately
+Path(os.environ.get("EDGAR_LOCAL_DATA_DIR", "")).mkdir(parents=True, exist_ok=True)
+
+from commonsense.config import DATA_DIR, EDGAR_EMAIL, GEMINI_API_KEY
 from commonsense.edgar.ingestion import run_ingestion
 from commonsense.analysis import run_analysis_all
+
+# -----------------------------------------------------------------------------
+# EDIT ONLY THE PROMPT BELOW — context (MD&A + common-size + flux) is attached automatically.
+# -----------------------------------------------------------------------------
+AI_ANALYSIS_PROMPT = """### ROLE AND CONTEXT ###
+You are acting as a Senior Equity Research Analyst with 20 years of experience in forensic accounting and sector-relative benchmarking. Your goal is to provide a "CommonSense" assessment of a company's financial health by synthesizing hard quantitative data with management's qualitative narrative.
+
+### OBJECTIVE ###
+Conduct a comprehensive financial health and operational outlook assessment for [TICKER]. You must bridge the gap between the provided Common-Sized Analysis, Flux Data (Horizontal Analysis), and the MD&A (Item 7) narrative.
+
+### ANALYST METHODOLOGY AND LOGIC ###
+    1. The Narrative-Financial Bridge:
+        - Deep-read the MD&A for management's stated "Growth Drivers" and "Cost Optimization" claims.
+        - Cross-reference these claims with the Flux Analysis.
+        - Logic: If management claims efficiency gains but SG&A as a % of Revenue (Common-Sized) is rising, flag the obfuscation.
+
+    2. Line-Item Interactivity (The "Forensic" Lens):
+        - You must look for interactions between specific line items:
+            - Inventory vs. COGS: Is a buildup in inventory masking a drop in demand or obsolescence?
+            - Accounts Receivable vs. Revenue: If AR grows significantly faster than Sales, investigate aggressive revenue recognition or credit quality issues.
+            - Capex vs. FCF: Based on the "Trends and Uncertainties" in the MD&A, is the current Free Cash Flow sufficient to fund the stated 12-month capital requirements?
+
+    3. Sector & Competitive Positioning:
+        - Use the provided Industry Benchmarks to determine if the company’s margins and flux are Idiosyncratic (company-specific) or Systemic (industry-wide).
+        - A "bad" flux is acceptable if it is better than the sector average; a "good" flux is a red flag if the company is falling behind its peers.
+
+### REQUIRED OUTPUT STRUCTURE ###
+    I. EXECUTIVE SUMMARY (The "CommonSense" Take):
+        - Provide a 3-sentence definitive bottom line on the company's financial trajectory and overall sentiment.
+        
+    II. NARRATIVE VS. REALITY TABLE:
+        | Management Claim (from MD&A) | Financial Evidence (from Data) | Analyst Verdict (Consistent/Inconsistent) |
+        | :--- | :--- | :--- |
+        | [Claim] | [Supporting or Refuting Metric] | [Verdict] |
+
+    III. THE "RED FLAG" INTERACTION ANALYSIS:
+        - Identify at least 3 specific interactions between line items (e.g., Debt-to-Equity vs. Interest Expense Flux) that suggest hidden operational or liquidity stress.
+
+    IV. FORWARD-LOOKING OUTLOOK:
+        - Based on the "Known Trends" in the MD&A and current liquidity ratios, provide a 12-month risk assessment.
+
+### DATA INPUTS ###
+Ticker: [TICKER]
+Industry Benchmarks: [BENCHMARKS]
+Common-Sized Data (Base: Rev/Assets): [DATA]
+Flux Data (Materiality: 10%/$1M): [DATA]
+MD&A Narrative Content: [TEXT]"""
+
+
+def _build_analysis_context(company_dir: Path) -> str:
+    """Gather MD&A files and common-size/flux CSVs under company_dir into one context string."""
+    parts: list[str] = []
+
+    mdna_files = sorted(company_dir.glob("*_mdna.txt")) + sorted(company_dir.glob("*_mdna.md"))
+    if mdna_files:
+        parts.append("## MD&A (Management's Discussion and Analysis)\n")
+        for f in mdna_files:
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace").strip()
+                if text:
+                    parts.append(f"### {f.name}\n{text}\n")
+            except Exception:
+                parts.append(f"### {f.name}\n[Could not read file.]\n")
+
+    for label, pattern in [("Common-size", "common_size_*.csv"), ("Flux", "flux_*.csv")]:
+        files = sorted(company_dir.glob(pattern))
+        if files:
+            parts.append(f"## {label}\n")
+            for f in files:
+                try:
+                    text = f.read_text(encoding="utf-8", errors="replace").strip()
+                    if text:
+                        parts.append(f"### {f.name}\n{text}\n")
+                except Exception:
+                    parts.append(f"### {f.name}\n[Could not read file.]\n")
+
+    return "\n".join(parts) if parts else ""
+
+
+def _run_ai_analysis(ticker: str, company_dir: Path, prompt: str, api_key: str) -> str | None:
+    """Call Gemini with prompt + context (MD&A + common-size + flux). Returns response text or None on error."""
+    context = _build_analysis_context(company_dir)
+    if not context.strip():
+        return None
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        full_content = f"{prompt}\n\n--- Context for {ticker} ---\n\n{context}"
+        response = model.generate_content(full_content)
+        if response and response.text:
+            return response.text.strip()
+        return None
+    except Exception as e:
+        print(f"  AI analysis error: {e}", file=sys.stderr)
+        return None
 
 
 def main() -> None:
@@ -87,6 +192,28 @@ def main() -> None:
             print(f"  {f}")
         if not csvs:
             print("  (no CSV files yet; check that fact Parquets exist in this directory)")
+        mdna_files = sorted(company_dir.glob("*_mdna.txt")) + sorted(company_dir.glob("*_mdna.md"))
+        if mdna_files:
+            print(f"\nMD&A files under {company_dir}:")
+            for f in mdna_files:
+                print(f"  {f}")
+
+        # AI analysis: Gemini with editable prompt + MD&A + common-size + flux context
+        if GEMINI_API_KEY:
+            print("\nRunning AI analysis (Gemini)...")
+            analysis_text = _run_ai_analysis(ticker, company_dir, AI_ANALYSIS_PROMPT, GEMINI_API_KEY)
+            if analysis_text:
+                print("\n--- AI Analysis ---")
+                print(analysis_text)
+                print("---")
+            else:
+                ctx = _build_analysis_context(company_dir)
+                if not ctx.strip():
+                    print("  (Skipped: no MD&A or analysis CSVs to send as context.)")
+                else:
+                    print("  (No analysis returned; check API key and context.)")
+        else:
+            print("\n(Skipping AI analysis: GEMINI_API_KEY not set in .env)")
     else:
         print(f"\nNo company directory at {DATA_DIR / ticker}; check ingestion errors above.")
 

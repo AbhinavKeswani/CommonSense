@@ -13,6 +13,7 @@ from commonsense.edgar.models import (
     CASH_FLOW_TABLE,
     INCOME_STATEMENT_TABLE,
 )
+from commonsense.edgar.mdna import write_mdna_for_filing
 from commonsense.edgar.sec_api import (
     DEFAULT_FORMS,
     fetch_submissions,
@@ -156,6 +157,26 @@ def run_ingestion(
                         meta_file = company_dir / f"{base_name}_meta.parquet"
                         meta_df.to_parquet(meta_file, index=False)
                         files_written.append(str(meta_file))
+
+                        # MD&A first (only needs accession + CIK from SEC; does not use filing.financials).
+                        # So we always try MD&A even if edgartools financials fail later.
+                        cik_for_mdna = cik_for_fallback if cik_for_fallback is not None else (int(cik_str) if (cik_str and str(cik_str).strip().isdigit()) else None)
+                        if accession_no and cik_for_mdna is not None:
+                            try:
+                                mdna_path = write_mdna_for_filing(
+                                    cik=cik_for_mdna,
+                                    accession_no=accession_no,
+                                    form=form,
+                                    user_agent=email,
+                                    company_dir=company_dir,
+                                    base_name=base_name,
+                                    delay_seconds=0.2,
+                                    use_md=False,
+                                )
+                                if mdna_path is not None:
+                                    files_written.append(str(mdna_path))
+                            except Exception:
+                                pass  # do not fail ingestion on MD&A errors
 
                         income_df, balance_df, cash_df = _safe_financials(filing)
                         if income_df is not None and not income_df.empty:

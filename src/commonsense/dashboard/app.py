@@ -1,12 +1,16 @@
 """Streamlit dashboard: trigger SEC EDGAR ingestion and show status."""
 
+import os
 import sys
 from pathlib import Path
 
 # Ensure project src is on path when running as: streamlit run src/commonsense/dashboard/app.py
-_src = Path(__file__).resolve().parent.parent.parent
-if str(_src) not in sys.path:
-    sys.path.insert(0, str(_src))
+_app_root = Path(__file__).resolve().parent.parent.parent
+if str(_app_root) not in sys.path:
+    sys.path.insert(0, str(_app_root))
+
+# Force edgartools cache under project (avoids ~/.edgar permission issues when not using run.sh)
+os.environ.setdefault("EDGAR_LOCAL_DATA_DIR", str(_app_root / "data" / ".edgar"))
 
 import streamlit as st
 

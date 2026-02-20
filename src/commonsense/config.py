@@ -21,6 +21,13 @@ DATA_DIR = Path(_DATA_DIR) if Path(_DATA_DIR).is_absolute() else (_PROJECT_ROOT 
 if "EDGAR_LOCAL_DATA_DIR" not in os.environ or not os.environ.get("EDGAR_LOCAL_DATA_DIR", "").strip():
     _edgar_cache = DATA_DIR.parent / ".edgar"
     os.environ["EDGAR_LOCAL_DATA_DIR"] = str(_edgar_cache.resolve())
+# Ensure the cache directory exists so edgartools can write without permission errors
+_edgar_dir = os.environ.get("EDGAR_LOCAL_DATA_DIR", "").strip()
+if _edgar_dir:
+    Path(_edgar_dir).mkdir(parents=True, exist_ok=True)
 
 # SEC EDGAR User-Agent (required by SEC); edgartools uses this via set_identity().
 EDGAR_EMAIL = os.environ.get("EDGAR_EMAIL", "").strip()
+
+# Gemini API key for AI analysis (run_ticker.py sends MD&A + common-size + flux as context).
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()

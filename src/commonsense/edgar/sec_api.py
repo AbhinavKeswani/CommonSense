@@ -279,6 +279,50 @@ def run_sec_api_fallback(
                 pd.DataFrame(all_rows).to_parquet(out, index=False)
                 files_written.append(str(out))
 
+    # MD&A: fetch for recent 10-K, 10-Q, 20-F from submissions (fallback path has no per-filing loop)
+    if sub is not None:
+        try:
+            from commonsense.edgar.mdna import _cik_to_int, write_mdna_for_filing
+            cik_int = _cik_to_int(cik)
+            if cik_int is not None:
+                filings = sub.get("filings") or {}
+                recent = filings.get("recent") or {}
+                acc_list = recent.get("accessionNumber")
+                form_list = recent.get("form")
+                date_list = recent.get("filingDate")
+                primary_list = recent.get("primaryDocument")
+                if acc_list and form_list and date_list:
+                    seen_per_form: dict[str, int] = {}
+                    max_per_form = 2
+                    for i in range(len(acc_list) - 1, -1, -1):
+                        fform = (form_list[i] or "").strip()
+                        if fform not in PERIODIC_FORMS:
+                            continue
+                        if seen_per_form.get(fform, 0) >= max_per_form:
+                            continue
+                        acc = (acc_list[i] or "").strip()
+                        fdate = (date_list[i] or "unknown").replace("-", "")[:8]
+                        if not acc:
+                            continue
+                        primary_doc = (primary_list[i] or "").strip() if primary_list and i < len(primary_list) else None
+                        base_name = f"{display_ticker}_{fform}_{fdate}"
+                        mdna_path = write_mdna_for_filing(
+                            cik=cik_int,
+                            accession_no=acc,
+                            form=fform,
+                            user_agent=user_agent,
+                            company_dir=company_dir,
+                            base_name=base_name,
+                            delay_seconds=delay_seconds,
+                            use_md=False,
+                            primary_document=primary_doc or None,
+                        )
+                        if mdna_path is not None:
+                            files_written.append(str(mdna_path))
+                            seen_per_form[fform] = seen_per_form.get(fform, 0) + 1
+        except Exception:
+            pass
+
     return {
         "files_written": files_written,
         "errors": errors,
