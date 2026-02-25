@@ -105,6 +105,9 @@ def _discover_companies_from_parquet(data_dir: Path) -> list[str]:
     # Subdirs as company tickers
     for child in data_dir.iterdir():
         if child.is_dir():
+            # Ignore numeric-only legacy CIK folders; canonical storage is ticker folders.
+            if child.name.isdigit():
+                continue
             for p in child.glob("*_sec_facts_*.parquet"):
                 companies.add(child.name)
                 break
@@ -113,7 +116,7 @@ def _discover_companies_from_parquet(data_dir: Path) -> list[str]:
         name = p.stem
         if "_sec_facts_" in name:
             ticker = name.split("_sec_facts_")[0].strip()
-            if ticker:
+            if ticker and not ticker.isdigit():
                 companies.add(ticker)
     return sorted(companies)
 

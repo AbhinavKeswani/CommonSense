@@ -2,7 +2,7 @@
 
 A private, localized financial intelligence pipeline. CommonSense ingests SEC EDGAR data, runs common-size and flux analysis, extracts MD&A from filings, and stores results per company so you can feed them into a local LLM for analyst-style output—all without leaving your machine.
 
-**Current state (v1):** SEC ingestion, per-ticker storage, MD&A extraction (Item 7 / 2 / 5), common-size and flux analysis (CSV), and a one-command test runner plus a Streamlit dashboard to trigger ingestion from the browser. We’re working on modifying the local models now for the analysis step.
+**Current state (v1, reality check):** SEC ingestion, per-ticker storage, MD&A extraction (Item 7 / 2 / 5), common-size and flux analysis (CSV), and a one-command test runner plus a Streamlit dashboard all run end-to-end. The major gap is MD&A quality: extraction is still inconsistent and often captures TOC/adjacent sections instead of the clean MD&A body.
 
 ---
 
@@ -24,6 +24,21 @@ A private, localized financial intelligence pipeline. CommonSense ingests SEC ED
   - **MD&A:** `{base}_mdna.txt` per filing (Management’s Discussion and Analysis: 10-K Item 7, 10-Q Item 2, 20-F Item 5), for use as narrative context alongside the numbers.
 - **Identity:** SEC requires a User-Agent. Set `EDGAR_EMAIL` in `.env`; it’s used as the contact identity (no sign-up). The edgartools cache is pointed at **`data/.edgar`** inside the project by default so you don’t need write access to `~/.edgar`.
 
+### 1.1 Current validation snapshot (Feb 2026)
+
+- **Run attempted on new SPX ticker not in local data (`NVDA`):**
+  - Command: `python run_ticker.py NVDA`
+  - Result: failed before ingestion with `could not resolve to CIK`.
+  - Observed errors included SEC ticker fetch failures and cache writes to `~/.edgar/_cache` (permission blocked), so no `data/parquet/NVDA/` was created.
+- **Run attempted on new SPX company by CIK (`731766`, UnitedHealth/UNH):**
+  - Command: `python run_ticker.py 731766`
+  - Result: fallback path succeeded and created `data/parquet/UNH/` with:
+    - `UNH_sec_submissions.parquet`
+    - `UNH_sec_facts_{income_statement,balance_sheet,cash_flow}.parquet`
+    - `common_size_*.csv` and `flux_*.csv`
+    - `UNH_*_mdna.txt`
+  - edgartools form loop still emitted `~/.edgar/_cache` permission errors, but fallback data was written.
+
 ### 2. Common-size and flux analysis
 
 - **Input:** The analysis module reads the fact Parquets for each company (income, balance sheet, cash flow). Line items are taken **directly from each company’s data** (concept names in the Parquet)—no separate mapping file.
@@ -35,6 +50,7 @@ A private, localized financial intelligence pipeline. CommonSense ingests SEC ED
   - `common_size_income_statement.csv`, `common_size_balance_sheet.csv`, `common_size_cash_flow.csv`
   - `flux_income_statement.csv`, `flux_balance_sheet.csv`, `flux_cash_flow.csv`  
   These are intended for review and for feeding into local models (we’re working on that integration).
+- **Important behavior:** `run_ticker.py` currently runs `run_analysis_all(DATA_DIR)`, so it recomputes analysis for all companies in `data/parquet/`, not just the ticker passed on the command line.
 
 ### 3. Dashboard and test runner
 
@@ -141,6 +157,27 @@ See `.env.example`.
 - **“Both data sources are unavailable” / hishel / ticker lookup:** We resolve ticker to CIK via the SEC company_tickers.json API first; if that fails, edgartools is tried. If both fail, use a **CIK** instead (e.g. `320193` for Apple, `353278` for Novo Nordisk/NVO). The project sets `EDGAR_LOCAL_DATA_DIR` to `data/.edgar` by default. See **Docs/EDGAR_Ingestion_Troubleshooting.md** for more.
 - **NVO or other foreign tickers:** We discover forms from submissions, so 20-F is requested automatically when the company files it. If the ticker still does not resolve, use the company CIK (e.g. `run_ticker.py 353278` for Novo Nordisk).
 - **Permission errors on `~/.edgar`:** Ensure `EDGAR_LOCAL_DATA_DIR` is set (e.g. in `.env` to `data/.edgar`) or let the default in `config.py` apply. See **Docs/EDGAR_Ingestion_Troubleshooting.md** for more detail.
+
+---
+
+## Known gaps (highest priority)
+
+- **MD&A extraction quality is not reliable across issuers/forms yet.**
+  - In multiple outputs, extracted text starts at TOC `Item 7/Item 2` markers and includes non-MD&A sections (e.g. `Item 1 Business` or financial statements) instead of a clean MD&A body.
+  - This is the main blocker for high-quality narrative analysis.
+- **edgartools still touches `~/.edgar/_cache` in some paths.**
+  - Even with project-local cache defaults, some requests still attempt writes under home directory cache and can fail with permissions.
+  - When this happens, fallback `data.sec.gov` JSON ingestion still allows data collection.
+- **`run_ticker.py` reporting can be misleading after failed ingestion.**
+  - If the requested ticker folder is missing, it currently prints an existing folder with CSVs (first match), which can look like a successful write for the requested ticker when it is not.
+
+---
+
+## Next focus
+
+- Make MD&A extraction robust for every company/form by improving section start/end targeting and validating against saved raw filings.
+- Eliminate cache-path instability so ticker/CIK runs do not depend on writable `~/.edgar`.
+- Update `run_ticker.py` output to report only the requested ticker/CIK results.
 
 ---
 

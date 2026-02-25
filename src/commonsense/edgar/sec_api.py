@@ -87,6 +87,34 @@ def ticker_to_cik(ticker: str, user_agent: str) -> str | None:
         return None
 
 
+def cik_to_ticker(cik: int | str, user_agent: str) -> str | None:
+    """Resolve CIK to ticker via SEC company_tickers.json. Returns uppercase ticker or None."""
+    import urllib.request
+    cik_norm = str(cik).strip()
+    if not cik_norm:
+        return None
+    cik_no_zeros = cik_norm.lstrip("0") or "0"
+    req = urllib.request.Request(SEC_COMPANY_TICKERS, headers=_headers(user_agent))
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            import json
+            data = json.load(resp)
+        if not isinstance(data, dict):
+            return None
+        for _key, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            entry_cik = entry.get("cik_str")
+            if entry_cik is None:
+                continue
+            if str(entry_cik).strip().lstrip("0") == cik_no_zeros:
+                t = str(entry.get("ticker", "")).strip().upper()
+                return t or None
+        return None
+    except Exception:
+        return None
+
+
 def get_periodic_forms_from_submissions(sub: dict[str, Any] | None) -> list[str]:
     """
     Return the list of periodic report forms (from PERIODIC_FORMS) that this company
@@ -202,6 +230,8 @@ def run_sec_api_fallback(
     output_dir: str | Path,
     user_agent: str,
     delay_seconds: float = 0.2,
+    forms: list[str] | None = None,
+    max_filings_per_form: int = 5,
 ) -> dict[str, Any]:
     """
     Fetch submissions and company facts from data.sec.gov for the given CIK;
@@ -217,7 +247,11 @@ def run_sec_api_fallback(
     # Submissions (fetch first so we can resolve ticker for folder name)
     sub = fetch_submissions(cik, user_agent)
     time.sleep(delay_seconds)
-    display_ticker = _ticker_from_submissions(sub) or ticker_label
+    display_ticker = (
+        _ticker_from_submissions(sub)
+        or cik_to_ticker(cik, user_agent)
+        or str(ticker_label).strip().upper()
+    )
     company_dir = base_dir / display_ticker
     company_dir.mkdir(parents=True, exist_ok=True)
 
@@ -279,26 +313,41 @@ def run_sec_api_fallback(
                 pd.DataFrame(all_rows).to_parquet(out, index=False)
                 files_written.append(str(out))
 
-    # MD&A: fetch for recent 10-K, 10-Q, 20-F from submissions (fallback path has no per-filing loop)
+    filings_count = 0
+    # MD&A: fetch for recent periodic filings from submissions.
     if sub is not None:
         try:
             from commonsense.edgar.mdna import _cik_to_int, write_mdna_for_filing
             cik_int = _cik_to_int(cik)
             if cik_int is not None:
+                requested_forms = [
+                    f.strip().upper()
+                    for f in (forms or [])
+                    if isinstance(f, str) and f.strip().upper() in PERIODIC_FORMS
+                ]
+                discovered_forms = get_periodic_forms_from_submissions(sub)
+                if discovered_forms:
+                    forms_to_use = [f for f in discovered_forms if not requested_forms or f in requested_forms]
+                    if not forms_to_use:
+                        forms_to_use = discovered_forms
+                else:
+                    forms_to_use = requested_forms or list(DEFAULT_FORMS)
+
                 filings = sub.get("filings") or {}
                 recent = filings.get("recent") or {}
                 acc_list = recent.get("accessionNumber")
                 form_list = recent.get("form")
                 date_list = recent.get("filingDate")
+                period_list = recent.get("reportDate")
                 primary_list = recent.get("primaryDocument")
                 if acc_list and form_list and date_list:
                     seen_per_form: dict[str, int] = {}
-                    max_per_form = 2
-                    for i in range(len(acc_list) - 1, -1, -1):
+                    company_name = str(sub.get("name") or display_ticker)
+                    for i in range(len(acc_list)):
                         fform = (form_list[i] or "").strip()
-                        if fform not in PERIODIC_FORMS:
+                        if fform not in forms_to_use:
                             continue
-                        if seen_per_form.get(fform, 0) >= max_per_form:
+                        if seen_per_form.get(fform, 0) >= max_filings_per_form:
                             continue
                         acc = (acc_list[i] or "").strip()
                         fdate = (date_list[i] or "unknown").replace("-", "")[:8]
@@ -306,6 +355,23 @@ def run_sec_api_fallback(
                             continue
                         primary_doc = (primary_list[i] or "").strip() if primary_list and i < len(primary_list) else None
                         base_name = f"{display_ticker}_{fform}_{fdate}"
+                        period = (period_list[i] or "") if period_list and i < len(period_list) else ""
+
+                        # Keep per-filing metadata so downstream inspection can trace exact filing used.
+                        meta_df = pd.DataFrame([{
+                            "ticker": display_ticker,
+                            "cik": cik_str,
+                            "company": company_name,
+                            "form": fform,
+                            "filing_date": date_list[i] if i < len(date_list) else "",
+                            "accession_no": acc,
+                            "period_of_report": period,
+                            "primary_document": primary_doc or "",
+                        }])
+                        meta_out = company_dir / f"{base_name}_meta.parquet"
+                        meta_df.to_parquet(meta_out, index=False)
+                        files_written.append(str(meta_out))
+
                         mdna_path = write_mdna_for_filing(
                             cik=cik_int,
                             accession_no=acc,
@@ -317,6 +383,7 @@ def run_sec_api_fallback(
                             use_md=False,
                             primary_document=primary_doc or None,
                         )
+                        filings_count += 1
                         if mdna_path is not None:
                             files_written.append(str(mdna_path))
                             seen_per_form[fform] = seen_per_form.get(fform, 0) + 1
@@ -328,4 +395,6 @@ def run_sec_api_fallback(
         "errors": errors,
         "cik": cik_str,
         "ticker": display_ticker,
+        "company_dir": str(company_dir),
+        "filings_count": filings_count,
     }

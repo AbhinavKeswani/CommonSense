@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Test runner: pass a ticker as the only argument to run ingestion + analysis and verify storage.
 
@@ -11,17 +13,18 @@ Runs:
   1. SEC EDGAR ingestion for the ticker (10-K, 10-Q, 20-F) → facts Parquet + MD&A .txt under data/parquet/<ticker>/
   2. Common-size and flux analysis → CSV only under data/parquet/<ticker>/
 
-Prints a short summary, paths to analysis CSVs and MD&A files, and Gemini AI analysis (if GEMINI_API_KEY is set) using an editable prompt and the same context.
+Prints a short summary and paths to analysis CSVs and MD&A files. Optionally runs Gemini AI analysis (see ENABLE_GEMINI_ANALYSIS in script).
 """
 
 import os
 import sys
 from pathlib import Path
+from datetime import datetime, timezone
 
 # Project root (run_ticker.py lives here)
 _PROJECT_ROOT = Path(__file__).resolve().parent
 
-# Force edgartools cache under project so we always have write permission (avoids ~/.edgar)
+# Force EDGAR cache under project (used by some dependencies/utilities).
 os.environ.setdefault("EDGAR_LOCAL_DATA_DIR", str(_PROJECT_ROOT / "data" / ".edgar"))
 
 # Ensure project root and src on path
@@ -34,12 +37,16 @@ try:
 except ImportError:
     pass
 
-# Create cache dir so edgartools can write immediately
+# Create cache dir immediately.
 Path(os.environ.get("EDGAR_LOCAL_DATA_DIR", "")).mkdir(parents=True, exist_ok=True)
 
 from commonsense.config import DATA_DIR, EDGAR_EMAIL, GEMINI_API_KEY
 from commonsense.edgar.ingestion import run_ingestion
 from commonsense.analysis import run_analysis_all
+
+# Set to True to run Gemini AI analysis after ingestion (MD&A + common-size + flux → analysis).
+ENABLE_GEMINI_ANALYSIS = True
+GEMINI_MODEL = "gemini-2.5-flash"
 
 # -----------------------------------------------------------------------------
 # EDIT ONLY THE PROMPT BELOW — context (MD&A + common-size + flux) is attached automatically.
@@ -67,6 +74,8 @@ Conduct a comprehensive financial health and operational outlook assessment for 
         - A "bad" flux is acceptable if it is better than the sector average; a "good" flux is a red flag if the company is falling behind its peers.
 
 ### REQUIRED OUTPUT STRUCTURE ###
+Return your full answer in valid Markdown, using clear headings, bullets, and the required table format.
+
     I. EXECUTIVE SUMMARY (The "CommonSense" Take):
         - Provide a 3-sentence definitive bottom line on the company's financial trajectory and overall sentiment.
         
@@ -81,19 +90,22 @@ Conduct a comprehensive financial health and operational outlook assessment for 
     IV. FORWARD-LOOKING OUTLOOK:
         - Based on the "Known Trends" in the MD&A and current liquidity ratios, provide a 12-month risk assessment.
 
-### DATA INPUTS ###
-Ticker: [TICKER]
-Industry Benchmarks: [BENCHMARKS]
-Common-Sized Data (Base: Rev/Assets): [DATA]
-Flux Data (Materiality: 10%/$1M): [DATA]
-MD&A Narrative Content: [TEXT]"""
+"""
+
+
+def _collect_analysis_inputs(company_dir: Path) -> tuple[list[Path], list[Path], list[Path]]:
+    """Return (mdna_files, common_size_csvs, flux_csvs) under company_dir."""
+    mdna_files = sorted(company_dir.glob("*_mdna.txt")) + sorted(company_dir.glob("*_mdna.md"))
+    common_size_csvs = sorted(company_dir.glob("common_size_*.csv"))
+    flux_csvs = sorted(company_dir.glob("flux_*.csv"))
+    return mdna_files, common_size_csvs, flux_csvs
 
 
 def _build_analysis_context(company_dir: Path) -> str:
     """Gather MD&A files and common-size/flux CSVs under company_dir into one context string."""
     parts: list[str] = []
 
-    mdna_files = sorted(company_dir.glob("*_mdna.txt")) + sorted(company_dir.glob("*_mdna.md"))
+    mdna_files, common_size_csvs, flux_csvs = _collect_analysis_inputs(company_dir)
     if mdna_files:
         parts.append("## MD&A (Management's Discussion and Analysis)\n")
         for f in mdna_files:
@@ -104,8 +116,7 @@ def _build_analysis_context(company_dir: Path) -> str:
             except Exception:
                 parts.append(f"### {f.name}\n[Could not read file.]\n")
 
-    for label, pattern in [("Common-size", "common_size_*.csv"), ("Flux", "flux_*.csv")]:
-        files = sorted(company_dir.glob(pattern))
+    for label, files in [("Common-size", common_size_csvs), ("Flux", flux_csvs)]:
         if files:
             parts.append(f"## {label}\n")
             for f in files:
@@ -127,7 +138,7 @@ def _run_ai_analysis(ticker: str, company_dir: Path, prompt: str, api_key: str) 
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel(GEMINI_MODEL)
         full_content = f"{prompt}\n\n--- Context for {ticker} ---\n\n{context}"
         response = model.generate_content(full_content)
         if response and response.text:
@@ -136,6 +147,16 @@ def _run_ai_analysis(ticker: str, company_dir: Path, prompt: str, api_key: str) 
     except Exception as e:
         print(f"  AI analysis error: {e}", file=sys.stderr)
         return None
+
+
+def _write_ai_analysis_markdown(company_dir: Path, ticker: str, analysis_text: str) -> Path:
+    """Write AI analysis output to company_dir/Analysis as markdown and return path."""
+    analysis_dir = company_dir / "Analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ")
+    out_path = analysis_dir / f"{ticker}_gemini_analysis_{ts}.md"
+    out_path.write_text(analysis_text.strip() + "\n", encoding="utf-8")
+    return out_path
 
 
 def main() -> None:
@@ -177,13 +198,16 @@ def main() -> None:
         for e in analysis["errors"]:
             print(f"  Error: {e}")
 
-    # Show where data landed: prefer ticker subdir, else any subdir with analysis CSVs
+    # Show where data landed: prefer ticker dir; if input was CIK, resolve by metadata written this run.
     company_dir = DATA_DIR / ticker
     if not company_dir.is_dir():
-        dirs_with_csv = [d for d in DATA_DIR.iterdir() if d.is_dir() and list(d.glob("*.csv"))]
-        if dirs_with_csv:
-            company_dir = dirs_with_csv[0]
-            print(f"\nNote: ingestion wrote under {company_dir.name}/ (e.g. CIK resolved to ticker).")
+        meta_files = [Path(p) for p in ingest.get("files_written", []) if str(p).endswith("_meta.parquet")]
+        if meta_files:
+            company_dir = meta_files[0].parent
+            if company_dir.is_dir():
+                print(f"\nNote: CIK resolved to ticker folder {company_dir.name}/.")
+    if not company_dir.is_dir():
+        print(f"\nNo company directory found for requested input '{ticker}'.")
 
     if company_dir.is_dir():
         csvs = sorted(company_dir.glob("*.csv"))
@@ -197,23 +221,34 @@ def main() -> None:
             print(f"\nMD&A files under {company_dir}:")
             for f in mdna_files:
                 print(f"  {f}")
+        mdna_inputs, common_size_inputs, flux_inputs = _collect_analysis_inputs(company_dir)
+        print("\nAI context file coverage:")
+        print(f"  MD&A files: {len(mdna_inputs)}")
+        print(f"  Common-size CSVs: {len(common_size_inputs)}")
+        print(f"  Flux CSVs: {len(flux_inputs)}")
+        if not mdna_inputs:
+            print("  Warning: no MD&A files found for context.")
+        if not common_size_inputs or not flux_inputs:
+            print("  Warning: common-size/flux context is incomplete.")
 
-        # AI analysis: Gemini with editable prompt + MD&A + common-size + flux context
-        if GEMINI_API_KEY:
-            print("\nRunning AI analysis (Gemini)...")
+        # AI analysis: Gemini with editable prompt + MD&A + common-size + flux context (disabled for MD&A troubleshooting)
+        if ENABLE_GEMINI_ANALYSIS and GEMINI_API_KEY:
+            print(f"\nRunning AI analysis (Gemini: {GEMINI_MODEL})...")
             analysis_text = _run_ai_analysis(ticker, company_dir, AI_ANALYSIS_PROMPT, GEMINI_API_KEY)
             if analysis_text:
+                md_out = _write_ai_analysis_markdown(company_dir, company_dir.name, analysis_text)
                 print("\n--- AI Analysis ---")
                 print(analysis_text)
                 print("---")
+                print(f"\nSaved AI analysis markdown: {md_out}")
             else:
                 ctx = _build_analysis_context(company_dir)
                 if not ctx.strip():
                     print("  (Skipped: no MD&A or analysis CSVs to send as context.)")
                 else:
                     print("  (No analysis returned; check API key and context.)")
-        else:
-            print("\n(Skipping AI analysis: GEMINI_API_KEY not set in .env)")
+        elif not ENABLE_GEMINI_ANALYSIS:
+            print("\n(AI analysis disabled: set ENABLE_GEMINI_ANALYSIS = True in run_ticker.py to enable)")
     else:
         print(f"\nNo company directory at {DATA_DIR / ticker}; check ingestion errors above.")
 
