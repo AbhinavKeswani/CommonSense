@@ -172,6 +172,37 @@ See `.env.example`.
 
 ---
 
+## Example AAPL analysis (Gemini)
+
+Generated from a real local run (`python3 run_ticker.py 320193`) and saved under:
+
+`data/parquet/AAPL/Analysis/AAPL_gemini_analysis_20260226_155904Z.md`
+
+### Executive summary
+
+Apple's financial foundation remains exceptionally strong due to robust Services growth and formidable operational cash generation. However, a pattern of aggressive capital returns (primarily share repurchases) is steadily drawing down its once-massive cash reserves, introducing a subtle but growing liquidity vulnerability. Persistent macroeconomic headwinds and increasing tariff costs are also beginning to exert pressure on core product profitability, hinting at future operational challenges despite management's generally optimistic narrative.
+
+### Narrative vs reality (sample)
+
+| Management Claim (from MD&A) | Financial Evidence (from Data) | Analyst Verdict |
+|---|---|---|
+| **2023:** "Selling, general and administrative expense was relatively flat in 2023 compared to 2022." | Absolute SG&A decreased from $25,094M (2022) to $24,198M (2023), a -3.6% decline. | **Inconsistent** |
+| **2023:** "Products gross margin percentage increased during 2023 compared to 2022..." | Products gross margin increased from 35.88% (2022) to 36.63% (2023). | **Consistent** |
+| **2024:** "The growth in R&D expense during 2024 compared to 2023 was driven primarily by increases in headcount-related expenses." | R&D flux in 2024 vs 2023: +32.89%; R&D % of revenue increased from 7.80% to 8.02%. | **Consistent** |
+| **2025:** "Products gross margin percentage decreased during 2025 compared to 2024..." | Products gross margin decreased from 36.70% (2024) to 35.61% (2025). | **Consistent** |
+
+### Red-flag interactions (sample)
+
+- Accounts receivable grew while total net sales declined in 2023, suggesting potential collection/counterparty stress.
+- Cash and marketable securities declined materially over multiple years while buybacks/dividends stayed aggressive.
+- Product gross margin in 2025 showed pressure from tariff and mix effects despite internal cost actions.
+
+### Forward-looking outlook (sample)
+
+Risk assessment from the generated report: **Medium-Low** over the next 12 months, with strong Services and liquidity offset by continued margin/cost and macro-tariff pressures.
+
+---
+
 ## Deploy (online research system)
 
 - **Streamlit Community Cloud:** Connect the repo, set `EDGAR_EMAIL` (and optionally `DATA_DIR`, `EDGAR_LOCAL_DATA_DIR`) in secrets, entrypoint `src/commonsense/dashboard/app.py`.
