@@ -10,11 +10,9 @@ A private, localized financial intelligence pipeline. CommonSense ingests SEC ED
 
 ### 1. SEC EDGAR ingestion
 
-- **Ticker or CIK:** You can pass a ticker (e.g. `AAPL`, `MSFT`) or a CIK (e.g. `1652044`). The pipeline resolves ticker to CIK via the SEC company_tickers.json API first; if that fails, it tries edgartools. When only a CIK is used, the company ticker is taken from the SEC submissions API for folder and file names.
+- **Ticker or CIK:** You can pass a ticker (e.g. `AAPL`, `MSFT`) or a CIK (e.g. `320193`). The pipeline resolves ticker/CIK via SEC data endpoints and always writes under a ticker folder.
 - **Form discovery:** For each company we fetch submissions from data.sec.gov and read the filings.recent form list. We request only periodic report forms (10-K, 10-Q, 20-F, 40-F) that the company actually files. Foreign issuers (e.g. NVO) get 20-F automatically; domestic issuers get 10-K and 10-Q.
-- **Two paths:**
-  - **edgartools:** We call Company(CIK) and request filings only for the forms discovered from submissions. Writes metadata and statement Parquets under a per-company directory.
-  - **Fallback (data.sec.gov):** If edgartools fails (e.g. “Unknown SGML format”), the code falls back to the SEC JSON APIs: submissions and company facts (XBRL). Facts are flattened into long-form tables and written as Parquet. No SGML parsing, so it works even when filing formats differ.
+- **Single path:** SEC JSON endpoints for submissions/companyfacts + SEC Archives HTML for MD&A extraction. No SGML parsing path is required in the ingestion flow.
 - **Output:** All output is under **`data/parquet/<ticker>/`** (e.g. `data/parquet/AAPL/`, `data/parquet/NVO/`). For each company you get:
   - `{ticker}_sec_submissions.parquet` (filing list; used for form discovery)
   - `{ticker}_sec_facts_income_statement.parquet`
@@ -62,6 +60,33 @@ A private, localized financial intelligence pipeline. CommonSense ingests SEC ED
   ```
   This runs ingestion using discovered forms per company (10-K/10-Q for domestic, 20-F for foreign issuers, etc.), then runs analysis for all companies in `DATA_DIR`, and prints where the analysis CSVs and MD&A files were written. Use it to confirm that data is stored correctly after setup.
 
+### 3.1 Example execution (AAPL + Gemini Markdown output)
+
+Use CIK if ticker lookup is flaky in your environment:
+
+```bash
+python3 run_ticker.py 320193
+```
+
+What this run produces under `data/parquet/AAPL/`:
+
+- MD&A files (10-K/10-Q): `AAPL_*_mdna.txt`
+- Structured analysis:
+  - `common_size_income_statement.csv`
+  - `common_size_balance_sheet.csv`
+  - `common_size_cash_flow.csv`
+  - `flux_income_statement.csv`
+  - `flux_balance_sheet.csv`
+  - `flux_cash_flow.csv`
+- Gemini report (Markdown) under:
+  - `data/parquet/AAPL/Analysis/AAPL_gemini_analysis_20260226_155904Z.md`
+
+The AI context for this run included:
+
+- MD&A files: 10
+- Common-size CSVs: 3
+- Flux CSVs: 3
+
 ---
 
 ## Project layout
@@ -91,7 +116,9 @@ CommonSense/
 │           ├── {ticker}_sec_facts_*.parquet
 │           ├── *_mdna.txt
 │           ├── common_size_*.csv
-│           └── flux_*.csv
+│           ├── flux_*.csv
+│           └── Analysis/
+│               └── *_gemini_analysis_*.md
 └── Docs/                # Charter, troubleshooting, API overview
 ```
 
@@ -162,14 +189,10 @@ See `.env.example`.
 
 ## Known gaps (highest priority)
 
-- **MD&A extraction quality is not reliable across issuers/forms yet.**
-  - In multiple outputs, extracted text starts at TOC `Item 7/Item 2` markers and includes non-MD&A sections (e.g. `Item 1 Business` or financial statements) instead of a clean MD&A body.
-  - This is the main blocker for high-quality narrative analysis.
-- **edgartools still touches `~/.edgar/_cache` in some paths.**
-  - Even with project-local cache defaults, some requests still attempt writes under home directory cache and can fail with permissions.
-  - When this happens, fallback `data.sec.gov` JSON ingestion still allows data collection.
-- **`run_ticker.py` reporting can be misleading after failed ingestion.**
-  - If the requested ticker folder is missing, it currently prints an existing folder with CSVs (first match), which can look like a successful write for the requested ticker when it is not.
+- **MD&A extraction quality is improved but not perfect across all historical issuer/form variants.**
+  - Newer filings are generally clean; some older filings may still include residual document artifacts that need further filtering.
+- **Ticker lookup can fail in some environments.**
+  - Workaround: run by CIK (e.g. `320193` for Apple) and output still lands under ticker folder (`AAPL/`).
 
 ---
 
