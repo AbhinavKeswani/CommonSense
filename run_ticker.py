@@ -55,7 +55,7 @@ AI_ANALYSIS_PROMPT = """### ROLE AND CONTEXT ###
 You are acting as a Senior Equity Research Analyst with 20 years of experience in forensic accounting and sector-relative benchmarking. Your goal is to provide a "CommonSense" assessment of a company's financial health by synthesizing hard quantitative data with management's qualitative narrative.
 
 ### OBJECTIVE ###
-Conduct a comprehensive financial health and operational outlook assessment for [TICKER]. You must bridge the gap between the provided Common-Sized Analysis, Flux Data (Horizontal Analysis), and the MD&A (Item 7) narrative.
+Conduct a comprehensive financial health and operational outlook assessment for [TICKER]. You must bridge the gap between the provided Common-Sized Analysis, Flux Data (Horizontal Analysis), Ratio Analysis (levels + fluctuations), and the MD&A (Item 7) narrative.
 
 ### ANALYST METHODOLOGY AND LOGIC ###
     1. The Narrative-Financial Bridge:
@@ -72,6 +72,10 @@ Conduct a comprehensive financial health and operational outlook assessment for 
     3. Sector & Competitive Positioning:
         - Use the provided Industry Benchmarks to determine if the company’s margins and flux are Idiosyncratic (company-specific) or Systemic (industry-wide).
         - A "bad" flux is acceptable if it is better than the sector average; a "good" flux is a red flag if the company is falling behind its peers.
+    4. Reconciliation Discipline (Required):
+        - Use ONLY values present in the provided CSV context (common-size, flux, ratios, ratio-flux).
+        - Do not invent values.
+        - For each major MD&A claim, cite at least one numeric metric from our calculated outputs and classify support as Match, Partial, or Mismatch.
 
 ### REQUIRED OUTPUT STRUCTURE ###
 Return your full answer in valid Markdown, using clear headings, bullets, and the required table format.
@@ -89,23 +93,28 @@ Return your full answer in valid Markdown, using clear headings, bullets, and th
 
     IV. FORWARD-LOOKING OUTLOOK:
         - Based on the "Known Trends" in the MD&A and current liquidity ratios, provide a 12-month risk assessment.
+    V. RECONCILIATION CHECK (Required):
+        - Provide a short table with at least 5 checks:
+          | Metric / Claim | Value from our CSV output | MD&A statement | Match status (Match / Partial / Mismatch) |
 
 """
 
 
-def _collect_analysis_inputs(company_dir: Path) -> tuple[list[Path], list[Path], list[Path]]:
-    """Return (mdna_files, common_size_csvs, flux_csvs) under company_dir."""
+def _collect_analysis_inputs(company_dir: Path) -> tuple[list[Path], list[Path], list[Path], list[Path], list[Path]]:
+    """Return (mdna_files, common_size_csvs, statement_flux_csvs, ratio_level_csvs, ratio_flux_csvs)."""
     mdna_files = sorted(company_dir.glob("*_mdna.txt")) + sorted(company_dir.glob("*_mdna.md"))
     common_size_csvs = sorted(company_dir.glob("common_size_*.csv"))
-    flux_csvs = sorted(company_dir.glob("flux_*.csv"))
-    return mdna_files, common_size_csvs, flux_csvs
+    statement_flux_csvs = [p for p in sorted(company_dir.glob("flux_*.csv")) if not p.name.startswith("flux_ratios_")]
+    ratio_level_csvs = sorted(company_dir.glob("ratios_*.csv"))
+    ratio_flux_csvs = sorted(company_dir.glob("flux_ratios_*.csv"))
+    return mdna_files, common_size_csvs, statement_flux_csvs, ratio_level_csvs, ratio_flux_csvs
 
 
 def _build_analysis_context(company_dir: Path) -> str:
     """Gather MD&A files and common-size/flux CSVs under company_dir into one context string."""
     parts: list[str] = []
 
-    mdna_files, common_size_csvs, flux_csvs = _collect_analysis_inputs(company_dir)
+    mdna_files, common_size_csvs, statement_flux_csvs, ratio_level_csvs, ratio_flux_csvs = _collect_analysis_inputs(company_dir)
     if mdna_files:
         parts.append("## MD&A (Management's Discussion and Analysis)\n")
         for f in mdna_files:
@@ -116,7 +125,7 @@ def _build_analysis_context(company_dir: Path) -> str:
             except Exception:
                 parts.append(f"### {f.name}\n[Could not read file.]\n")
 
-    for label, files in [("Common-size", common_size_csvs), ("Flux", flux_csvs)]:
+    for label, files in [("Common-size", common_size_csvs), ("Flux", statement_flux_csvs)]:
         if files:
             parts.append(f"## {label}\n")
             for f in files:
@@ -126,6 +135,24 @@ def _build_analysis_context(company_dir: Path) -> str:
                         parts.append(f"### {f.name}\n{text}\n")
                 except Exception:
                     parts.append(f"### {f.name}\n[Could not read file.]\n")
+    if ratio_level_csvs:
+        parts.append("## Ratios (Levels)\n")
+        for f in ratio_level_csvs:
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace").strip()
+                if text:
+                    parts.append(f"### {f.name}\n{text}\n")
+            except Exception:
+                parts.append(f"### {f.name}\n[Could not read file.]\n")
+    if ratio_flux_csvs:
+        parts.append("## Ratio Fluctuations (Flux)\n")
+        for f in ratio_flux_csvs:
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace").strip()
+                if text:
+                    parts.append(f"### {f.name}\n{text}\n")
+            except Exception:
+                parts.append(f"### {f.name}\n[Could not read file.]\n")
 
     return "\n".join(parts) if parts else ""
 
@@ -221,15 +248,17 @@ def main() -> None:
             print(f"\nMD&A files under {company_dir}:")
             for f in mdna_files:
                 print(f"  {f}")
-        mdna_inputs, common_size_inputs, flux_inputs = _collect_analysis_inputs(company_dir)
+        mdna_inputs, common_size_inputs, statement_flux_inputs, ratio_level_inputs, ratio_flux_inputs = _collect_analysis_inputs(company_dir)
         print("\nAI context file coverage:")
         print(f"  MD&A files: {len(mdna_inputs)}")
         print(f"  Common-size CSVs: {len(common_size_inputs)}")
-        print(f"  Flux CSVs: {len(flux_inputs)}")
+        print(f"  Statement flux CSVs: {len(statement_flux_inputs)}")
+        print(f"  Ratio level CSVs: {len(ratio_level_inputs)}")
+        print(f"  Ratio flux CSVs: {len(ratio_flux_inputs)}")
         if not mdna_inputs:
             print("  Warning: no MD&A files found for context.")
-        if not common_size_inputs or not flux_inputs:
-            print("  Warning: common-size/flux context is incomplete.")
+        if not common_size_inputs or not statement_flux_inputs or not ratio_level_inputs or not ratio_flux_inputs:
+            print("  Warning: common-size/flux/ratio-level/ratio-flux context is incomplete.")
 
         # AI analysis: Gemini with editable prompt + MD&A + common-size + flux context (disabled for MD&A troubleshooting)
         if ENABLE_GEMINI_ANALYSIS and GEMINI_API_KEY:

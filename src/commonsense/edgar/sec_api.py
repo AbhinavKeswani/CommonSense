@@ -183,7 +183,21 @@ def _companyfacts_to_dataframes(data: dict[str, Any]) -> tuple[pd.DataFrame, pd.
 
     # Common US-GAAP tags by statement type (subset)
     INCOME_TAGS = {"Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "NetIncomeLoss", "GrossProfit", "OperatingIncomeLoss", "CostOfRevenue", "OperatingExpenses", "ResearchAndDevelopmentExpense", "SellingGeneralAndAdministrativeExpense"}
-    BALANCE_TAGS = {"Assets", "Liabilities", "StockholdersEquity", "LiabilitiesAndStockholdersEquity", "CashAndCashEquivalentsAtCarryingValue", "AccountsReceivableNetCurrent", "InventoryNet", "PropertyPlantAndEquipmentNet", "AccountsPayableCurrent", "LongTermDebt", "ShortTermDebt"}
+    BALANCE_TAGS = {
+        "Assets",
+        "Liabilities",
+        "StockholdersEquity",
+        "LiabilitiesAndStockholdersEquity",
+        "CashAndCashEquivalentsAtCarryingValue",
+        "AccountsReceivableNetCurrent",
+        "InventoryNet",
+        "PropertyPlantAndEquipmentNet",
+        "AccountsPayableCurrent",
+        "LongTermDebt",
+        "ShortTermDebt",
+        "CommonStockSharesOutstanding",
+        "EntityCommonStockSharesOutstanding",
+    }
     CASH_TAGS = {"NetCashProvidedByUsedInOperatingActivities", "NetCashProvidedByUsedInInvestingActivities", "NetCashProvidedByUsedInFinancingActivities", "CashAndCashEquivalentsPeriodIncreaseDecrease"}
 
     def emit(concept: str, unit: str, facts_list: list, target: list[dict], tag: str):
