@@ -58,6 +58,18 @@ MIN_CHARS_BEFORE_END_MARKER = 800
 # Sections shorter than this are treated as TOC/nav; we prefer a start that yields longer content (real MD&A body).
 MIN_MDNA_SECTION_CHARS = 1500
 
+# Upper bound on emitted MD&A. Some issuers (esp. banks like JPM, whose Item 7
+# "appears on pages 46-160" and flows into a ~900K-char financial review) have no
+# clean Item 8 line-start boundary, so the section runs to nearly the whole doc.
+# Cap it so downstream LLM context stays usable; truncate at a paragraph boundary.
+MAX_MDNA_SECTION_CHARS = 200_000
+
+# A start heading that immediately reads as an "incorporated by reference" pointer
+# (e.g. "appears on pages 46-160") is a cross-reference, not the body — deprioritize it.
+_INCORP_BY_REF_RE = re.compile(
+    r"(?i)(incorporated\s+herein\s+by\s+reference|appears?\s+on\s+pages?\s+\d)",
+)
+
 
 def _clean_mdna_text(section: str) -> str:
     """
@@ -100,6 +112,24 @@ def _clean_mdna_text(section: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _looks_like_incorp_by_reference(remainder: str) -> bool:
+    """True if the heading is immediately followed by an incorporation-by-reference pointer."""
+    return bool(_INCORP_BY_REF_RE.search(remainder[:400]))
+
+
+def _truncate_at_boundary(text: str, limit: int) -> str:
+    """Truncate to <= limit chars at the last paragraph/sentence break, with a marker."""
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = head.rfind("\n\n")
+    if cut < limit * 0.6:  # no nearby paragraph break; fall back to sentence, then hard cut.
+        cut = head.rfind(". ")
+    if cut < limit * 0.6:
+        cut = limit
+    return head[:cut].rstrip() + "\n\n[... MD&A truncated for length ...]"
 
 
 def _looks_like_toc_start(remainder: str) -> bool:
@@ -319,12 +349,20 @@ def extract_mdna_from_html(html: str, form: str) -> str:
     # Prefer the longest section that looks like real MD&A (not TOC). TOC blocks are short;
     # if any start yields a long section, use the longest of those; otherwise use the longest overall.
     candidates = []
+    incorp_ref_starts = []
     for s in starts:
         remainder = text[s:]
         if _looks_like_toc_start(remainder):
             continue
+        # A cross-reference pointer ("appears on pages 46-160") is not the body; keep it as
+        # a last resort but prefer a start that opens with real prose when one exists.
+        if _looks_like_incorp_by_reference(remainder):
+            incorp_ref_starts.append((s, _section_end_pos(remainder)))
+            continue
         end_pos = _section_end_pos(remainder)
         candidates.append((s, end_pos))
+    if not candidates:
+        candidates = incorp_ref_starts
     if not candidates:
         for s in starts:
             remainder = text[s:]
@@ -339,7 +377,8 @@ def extract_mdna_from_html(html: str, form: str) -> str:
     end_pos = _section_end_pos(remainder)
     section = remainder[:end_pos]
     section = re.sub(r"\n{3,}", "\n\n", section).strip()
-    return _clean_mdna_text(section)
+    cleaned = _clean_mdna_text(section)
+    return _truncate_at_boundary(cleaned, MAX_MDNA_SECTION_CHARS)
 
 
 def fetch_and_extract_mdna(
