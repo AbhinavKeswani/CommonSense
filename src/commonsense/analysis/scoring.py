@@ -20,6 +20,64 @@ import pandas as pd
 
 from commonsense.analysis.valuation_multiples import compute_multiples
 
+# Data-driven rubric — the single source of truth for BOTH the score computation and
+# the methodology block emitted in scores.json (so the math and its definition can't
+# drift). Each metric maps linearly to 0-100 between floor (=0) and target (=100),
+# clamped; a pillar score is the mean of its metrics; the quality score is the
+# weighted mean of pillars. `source` is "ratio" (ratios_financial_health.csv) or
+# "multiple" (ratios_valuation_multiples.csv).
+PILLARS: list[dict[str, Any]] = [
+    {"name": "profitability", "weight": 0.30, "metrics": [
+        {"key": "net_margin_pct", "label": "Net margin %", "source": "ratio", "floor": 0, "target": 25},
+        {"key": "return_on_equity_pct", "label": "Return on equity %", "source": "ratio", "floor": 5, "target": 30},
+        {"key": "return_on_assets_pct", "label": "Return on assets %", "source": "ratio", "floor": 2, "target": 15},
+        {"key": "gross_margin_pct", "label": "Gross margin %", "source": "ratio", "floor": 20, "target": 70},
+    ]},
+    {"name": "growth", "weight": 0.25, "metrics": [
+        {"key": "revenue_cagr_pct", "label": "Revenue CAGR %", "source": "multiple", "floor": 0, "target": 20},
+        {"key": "earnings_cagr_pct", "label": "Earnings CAGR %", "source": "multiple", "floor": 0, "target": 25},
+    ]},
+    {"name": "balance_sheet", "weight": 0.20, "metrics": [
+        {"key": "debt_to_equity", "label": "Debt / equity", "source": "ratio", "floor": 2.0, "target": 0.0, "invert": True},
+        {"key": "current_ratio", "label": "Current ratio", "source": "ratio", "floor": 1.0, "target": 2.5},
+    ]},
+    {"name": "cash_conversion", "weight": 0.25, "metrics": [
+        {"key": "free_cash_flow_margin_pct", "label": "Free cash flow margin %", "source": "ratio", "floor": 0, "target": 25},
+        {"key": "operating_cash_flow_to_net_income", "label": "OCF / net income", "source": "ratio", "floor": 0.6, "target": 1.3},
+    ]},
+]
+
+VERDICT_BUCKETS = [(75, "strong"), (60, "solid"), (45, "watch")]
+
+
+def _verdict(score: float | None) -> str:
+    if score is None:
+        return "insufficient-data"
+    for cutoff, label in VERDICT_BUCKETS:
+        if score >= cutoff:
+            return label
+    return "weak"
+
+
+def methodology() -> dict[str, Any]:
+    """Human-/machine-readable definition of the scoring math (rendered in the report)."""
+    return {
+        "summary": (
+            "Each metric maps linearly to 0-100 between its floor (=0) and target (=100), "
+            "clamped. A pillar score is the mean of its metric scores; the quality score is "
+            "the weighted mean of the pillars. Higher is better."
+        ),
+        "verdict_buckets": {"strong": ">= 75", "solid": "60-74", "watch": "45-59", "weak": "< 45"},
+        "pillars": [
+            {"name": p["name"], "weight": p["weight"], "metrics": [
+                {"label": mt["label"], "source": mt["source"],
+                 "definition": (f"{mt['floor']} → {mt['target']}" + (" (inverted: lower is better)" if mt.get("invert") else ""))}
+                for mt in p["metrics"]
+            ]}
+            for p in PILLARS
+        ],
+    }
+
 
 def _score_linear(value: float | None, lo: float, hi: float, invert: bool = False) -> float | None:
     """Map value to 0-100 linearly between lo (=0) and hi (=100), clamped. invert flips it."""
@@ -87,39 +145,20 @@ def score_company(
     m = _latest_ratio_row(data_dir, ticker)
     mult = compute_multiples(ticker, data_dir, price=price, write_csv=True)
 
-    # --- Pillar sub-scores (0-100) ---
-    profitability = _mean([
-        _score_linear(m.get("net_margin_pct"), 0, 25),
-        _score_linear(m.get("return_on_equity_pct"), 5, 30),
-        _score_linear(m.get("return_on_assets_pct"), 2, 15),
-        _score_linear(m.get("gross_margin_pct"), 20, 70),
-    ])
-    growth = _mean([
-        _score_linear(mult.get("revenue_cagr_pct"), 0, 20),
-        _score_linear(mult.get("earnings_cagr_pct"), 0, 25),
-    ])
-    balance_sheet = _mean([
-        _score_linear(m.get("debt_to_equity"), 0.0, 2.0, invert=True),
-        _score_linear(m.get("current_ratio"), 1.0, 2.5),
-    ])
-    cash_conversion = _mean([
-        _score_linear(m.get("free_cash_flow_margin_pct"), 0, 25),
-        _score_linear(m.get("operating_cash_flow_to_net_income"), 0.6, 1.3),
-    ])
+    # --- Pillar sub-scores (0-100), driven by the PILLARS rubric ---
+    def _metric_value(mt: dict[str, Any]) -> float | None:
+        src = mult if mt["source"] == "multiple" else m
+        return src.get(mt["key"])
 
-    subscores = {
-        "profitability": profitability,
-        "growth": growth,
-        "balance_sheet": balance_sheet,
-        "cash_conversion": cash_conversion,
-    }
-    # Quality-gated growth: profitability + cash conversion carry the most weight.
-    quality_score = _weighted(subscores, {
-        "profitability": 0.30,
-        "growth": 0.25,
-        "balance_sheet": 0.20,
-        "cash_conversion": 0.25,
-    })
+    subscores: dict[str, float | None] = {}
+    weights: dict[str, float] = {}
+    for p in PILLARS:
+        subscores[p["name"]] = _mean([
+            _score_linear(_metric_value(mt), mt["floor"], mt["target"], invert=mt.get("invert", False))
+            for mt in p["metrics"]
+        ])
+        weights[p["name"]] = p["weight"]
+    quality_score = _weighted(subscores, weights)
 
     # --- Human-readable flags ---
     flags: list[str] = []
@@ -134,16 +173,7 @@ def score_company(
     if m.get("current_ratio") is not None and m["current_ratio"] < 1.0:
         flags.append("current ratio < 1 (liquidity watch)")
 
-    if quality_score is None:
-        verdict = "insufficient-data"
-    elif quality_score >= 75:
-        verdict = "strong"
-    elif quality_score >= 60:
-        verdict = "solid"
-    elif quality_score >= 45:
-        verdict = "watch"
-    else:
-        verdict = "weak"
+    verdict = _verdict(quality_score)
 
     result: dict[str, Any] = {
         "ticker": ticker,
@@ -151,6 +181,7 @@ def score_company(
         "quality_score": quality_score,
         "verdict": verdict,
         "subscores": subscores,
+        "methodology": methodology(),
         "flags": flags,
         "metrics": m,
         "multiples": mult,
