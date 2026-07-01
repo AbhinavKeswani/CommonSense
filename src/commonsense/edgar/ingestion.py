@@ -13,6 +13,12 @@ from commonsense.edgar.sec_api import (
     _ticker_from_submissions,
 )
 
+_CIK_HINTS = {
+    "GOOG": "1652044",
+    "GOOGL": "1652044",
+    "AAPL": "320193",
+}
+
 
 def run_ingestion(
     tickers: list[str],
@@ -51,7 +57,11 @@ def run_ingestion(
             cik_str = ticker_to_cik(raw, email)
             cik_int = int(cik_str) if cik_str else None
         if not cik_str and not cik_int:
-            errors.append(f"{ticker}: could not resolve to CIK (ticker not in SEC list?)")
+            hint = _CIK_HINTS.get(ticker)
+            if hint:
+                errors.append(f"{ticker}: could not resolve to CIK (ticker lookup unavailable). Try CIK {hint}.")
+            else:
+                errors.append(f"{ticker}: could not resolve to CIK (ticker lookup unavailable). Try running by CIK.")
             continue
 
         # Fetch submissions to discover which periodic forms this company actually files.
