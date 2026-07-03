@@ -30,6 +30,7 @@ import pandas as pd
 from commonsense.analysis import run_analysis_for_company, score_company
 from commonsense.config import DATA_DIR, EDGAR_EMAIL
 from commonsense.edgar.ingestion import run_ingestion
+from commonsense.market.prices import get_prices_batch
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_UNIVERSE = _PROJECT_ROOT / "universe" / "sp500.csv"
@@ -43,18 +44,25 @@ QUALITY_WEIGHT = 0.7
 CHEAPNESS_WEIGHT = 0.3
 
 
-def load_universe(path: str | Path) -> list[tuple[str, str]]:
-    """Read (symbol, sector) rows from a universe CSV. Sector defaults to 'Unknown'."""
+def load_universe(path: str | Path) -> list[dict[str, str]]:
+    """Read universe rows from a CSV. Accepts our own (symbol,sector,sub_industry,cik)
+    columns or the S&P 500 constituents export (Symbol,Security,GICS Sector,
+    GICS Sub-Industry,...,CIK)."""
     path = Path(path)
-    out: list[tuple[str, str]] = []
+    out: list[dict[str, str]] = []
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            sym = (row.get("symbol") or "").strip().upper()
+            r = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+            sym = (r.get("symbol") or "").upper()
             if not sym:
                 continue
-            sector = (row.get("sector") or "Unknown").strip() or "Unknown"
-            out.append((sym, sector))
+            out.append({
+                "symbol": sym,
+                "sector": r.get("sector") or r.get("gics sector") or "Unknown",
+                "sub_industry": r.get("sub_industry") or r.get("gics sub-industry") or "",
+                "cik": (r.get("cik") or "").lstrip("0"),
+            })
     return out
 
 
@@ -63,15 +71,21 @@ def _has_cached_facts(data_dir: Path, ticker: str) -> bool:
     return p.exists()
 
 
-def _ensure_ticker_data(ticker: str, data_dir: Path, email: str, *, ingest: bool, force: bool) -> bool:
-    """Ensure facts + analysis exist for `ticker`. Returns True if data is available."""
+def _ensure_ticker_data(entry: dict[str, str], data_dir: Path, email: str, *, ingest: bool, force: bool) -> bool:
+    """Ensure facts + analysis exist for a universe entry. Returns True if data is available.
+
+    Ingests by CIK when we have it (skips ticker→CIK resolution) and pulls XBRL facts
+    only (fetch_mdna=False) — MD&A is fetched on demand when a pick is opened.
+    """
+    ticker = entry["symbol"]
     if not force and _has_cached_facts(data_dir, ticker):
-        # Refresh analysis CSVs cheaply (no network) in case the code changed.
-        run_analysis_for_company(ticker, data_dir)
+        run_analysis_for_company(ticker, data_dir)  # cheap, no network
         return True
     if not ingest:
         return _has_cached_facts(data_dir, ticker)
-    res = run_ingestion(tickers=[ticker], forms=DEFAULT_FORMS, output_dir=data_dir, email=email)
+    ref = entry.get("cik") or ticker  # CIK is more reliable than ticker resolution
+    res = run_ingestion(tickers=[ref], forms=DEFAULT_FORMS, output_dir=data_dir,
+                        email=email, fetch_mdna=False)
     if res.get("errors"):
         for e in res["errors"]:
             print(f"    ingest: {e}", file=sys.stderr)
@@ -126,7 +140,7 @@ def _rank(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def screen_universe(
-    entries: list[tuple[str, str]],
+    entries: list[dict[str, str]],
     data_dir: str | Path = DATA_DIR,
     email: str = EDGAR_EMAIL,
     *,
@@ -140,20 +154,26 @@ def screen_universe(
     if limit is not None:
         entries = entries[:limit]
 
+    # Prices for the whole universe in a few batched requests (not one per name).
+    prices = get_prices_batch([e["symbol"] for e in entries])
+    print(f"Batched prices for {len(prices)}/{len(entries)} names.")
+
     rows: list[dict[str, Any]] = []
     skipped: list[str] = []
     total = len(entries)
-    for i, (symbol, sector) in enumerate(entries, 1):
+    for i, entry in enumerate(entries, 1):
+        symbol, sector = entry["symbol"], entry.get("sector", "Unknown")
         print(f"[{i}/{total}] {symbol} ({sector})...")
         try:
-            if not _ensure_ticker_data(symbol, data_dir, email, ingest=ingest, force=force):
+            if not _ensure_ticker_data(entry, data_dir, email, ingest=ingest, force=force):
                 skipped.append(f"{symbol}: no data (ingest={'on' if ingest else 'off'})")
                 continue
-            score = score_company(symbol, data_dir, write_json=True)
+            score = score_company(symbol, data_dir, price=prices.get(symbol), write_json=True)
             mult = score.get("multiples", {})
             rows.append({
                 "symbol": symbol,
                 "sector": sector,
+                "sub_industry": entry.get("sub_industry", ""),
                 "quality_score": score.get("quality_score"),
                 "verdict": score.get("verdict"),
                 "subscores": score.get("subscores"),
@@ -170,7 +190,6 @@ def screen_universe(
         except Exception as e:
             skipped.append(f"{symbol}: {e!s}")
             print(f"    error: {e}", file=sys.stderr)
-        time.sleep(0.2)  # be polite between names
 
     picks = _rank(rows)
     result = {

@@ -138,3 +138,35 @@ def get_quotes(symbols: list[str], delay: float = 0.4) -> dict[str, PriceQuote]:
         if q is not None:
             out[s.upper()] = q
     return out
+
+
+def get_prices_batch(symbols: list[str], chunk: int = 100) -> dict[str, float]:
+    """Latest close for many symbols in a FEW requests via yfinance batch download.
+
+    This is the efficient path for universe screening: one HTTP call per `chunk`
+    symbols instead of one per symbol. Returns {SYMBOL: last_close}.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        return {}
+    out: dict[str, float] = {}
+    syms = [s.upper().strip() for s in symbols if s and s.strip()]
+    for i in range(0, len(syms), chunk):
+        batch = syms[i:i + chunk]
+        yq = {s: s.replace(".", "-") for s in batch}  # Yahoo uses BRK-B, not BRK.B
+        try:
+            df = yf.download(list(yq.values()), period="5d", interval="1d", group_by="ticker",
+                             auto_adjust=True, progress=False, threads=True)
+        except Exception as e:  # noqa: BLE001
+            log.info("batch download failed (%d syms): %s", len(batch), e)
+            continue
+        for s in batch:
+            try:
+                sub = df[yq[s]] if yq[s] in df.columns.get_level_values(0) else df
+                ser = sub["Close"].dropna()
+                if len(ser):
+                    out[s] = round(float(ser.iloc[-1]), 4)
+            except Exception:
+                continue
+    return out

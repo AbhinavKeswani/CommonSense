@@ -282,11 +282,15 @@ def run_sec_api_fallback(
     delay_seconds: float = 0.2,
     forms: list[str] | None = None,
     max_filings_per_form: int = 5,
+    fetch_mdna: bool = True,
 ) -> dict[str, Any]:
     """
     Fetch submissions and company facts from data.sec.gov for the given CIK;
     write Parquet under output_dir/<ticker>/ so storage is by ticker (e.g. AAPL, GOOGL).
     Uses ticker from submissions JSON when available, else ticker_label (e.g. CIK).
+
+    fetch_mdna=False skips the (heavy) MD&A document fetches — used for bulk universe
+    screening, where only the XBRL financials are needed; MD&A is fetched on demand.
     """
     base_dir = Path(output_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -364,8 +368,8 @@ def run_sec_api_fallback(
                 files_written.append(str(out))
 
     filings_count = 0
-    # MD&A: fetch for recent periodic filings from submissions.
-    if sub is not None:
+    # MD&A: fetch for recent periodic filings from submissions (skipped in facts-only mode).
+    if fetch_mdna and sub is not None:
         try:
             from commonsense.edgar.mdna import _cik_to_int, write_mdna_for_filing
             cik_int = _cik_to_int(cik)
