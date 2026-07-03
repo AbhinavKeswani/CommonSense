@@ -124,14 +124,17 @@ def _rank(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if missing.any():
         df.loc[missing, "cheap_pctile"] = df.loc[missing, "cheap_metric"].rank(pct=True)
 
-    df["cheapness_score"] = df["cheap_pctile"].apply(
+    # cheap_pctile may hold pd.NA (names with no valuation metric) — astype(float)
+    # raises on NAType, so coerce through to_numeric instead.
+    cheap = pd.to_numeric(df["cheap_pctile"], errors="coerce")
+    df["cheapness_score"] = cheap.apply(
         lambda p: round((1.0 - float(p)) * 100.0, 1) if pd.notna(p) else 50.0
     )
     df["pick_score"] = (QUALITY_WEIGHT * df["quality_score"] + CHEAPNESS_WEIGHT * df["cheapness_score"]).round(1)
     df["mispricing"] = (
         (df["quality_score"] >= MISPRICING_MIN_QUALITY)
-        & df["cheap_pctile"].notna()
-        & (df["cheap_pctile"].astype(float) <= CHEAP_PERCENTILE)
+        & cheap.notna()
+        & (cheap <= CHEAP_PERCENTILE)
     )
     df = df.sort_values("pick_score", ascending=False).reset_index(drop=True)
     df["rank"] = df.index + 1
