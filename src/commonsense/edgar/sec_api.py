@@ -21,10 +21,19 @@ from commonsense.edgar.models import (
 SEC_SUBMISSIONS = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_COMPANYFACTS = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 SEC_COMPANY_TICKERS = "https://data.sec.gov/files/company_tickers.json"
+SEC_TICKER_TXT = "https://www.sec.gov/include/ticker.txt"
 
 # Periodic report forms we care about; we'll request only those that appear in a company's submissions.
 PERIODIC_FORMS = ("10-K", "10-Q", "20-F", "40-F")
 DEFAULT_FORMS = ["10-K", "10-Q", "20-F"]
+
+# Common symbol aliases that can fail in SEC ticker lists depending on source snapshots.
+TICKER_ALIASES = {
+    "GOOG": "GOOGL",
+    "FB": "META",
+    "BRK.B": "BRK-B",
+    "BF.B": "BF-B",
+}
 
 
 def _cik_pad(cik: int | str) -> str:
@@ -70,21 +79,48 @@ def ticker_to_cik(ticker: str, user_agent: str) -> str | None:
     ticker = (ticker or "").strip().upper()
     if not ticker:
         return None
+    ticker_candidates = [ticker]
+    alias = TICKER_ALIASES.get(ticker)
+    if alias and alias not in ticker_candidates:
+        ticker_candidates.append(alias)
+
+    # Primary source: SEC company_tickers.json
     req = urllib.request.Request(SEC_COMPANY_TICKERS, headers=_headers(user_agent))
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             import json
             data = json.load(resp)
-        if not isinstance(data, dict):
-            return None
-        for _key, entry in data.items():
-            if isinstance(entry, dict) and str(entry.get("ticker", "")).strip().upper() == ticker:
-                cik = entry.get("cik_str")
-                if cik is not None:
-                    return _cik_pad(cik)
-        return None
+        if isinstance(data, dict):
+            for t in ticker_candidates:
+                for _key, entry in data.items():
+                    if isinstance(entry, dict) and str(entry.get("ticker", "")).strip().upper() == t:
+                        cik = entry.get("cik_str")
+                        if cik is not None:
+                            return _cik_pad(cik)
     except Exception:
-        return None
+        pass
+
+    # Secondary fallback: SEC ticker.txt (ticker<tab>cik)
+    req2 = urllib.request.Request(SEC_TICKER_TXT, headers=_headers(user_agent))
+    try:
+        with urllib.request.urlopen(req2, timeout=15) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        mapping: dict[str, str] = {}
+        for line in text.splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) != 2:
+                continue
+            sym = parts[0].strip().upper()
+            cik_val = parts[1].strip()
+            if sym and cik_val.isdigit():
+                mapping[sym] = _cik_pad(cik_val)
+        for t in ticker_candidates:
+            if t in mapping:
+                return mapping[t]
+    except Exception:
+        pass
+
+    return None
 
 
 def cik_to_ticker(cik: int | str, user_agent: str) -> str | None:
@@ -246,11 +282,15 @@ def run_sec_api_fallback(
     delay_seconds: float = 0.2,
     forms: list[str] | None = None,
     max_filings_per_form: int = 5,
+    fetch_mdna: bool = True,
 ) -> dict[str, Any]:
     """
     Fetch submissions and company facts from data.sec.gov for the given CIK;
     write Parquet under output_dir/<ticker>/ so storage is by ticker (e.g. AAPL, GOOGL).
     Uses ticker from submissions JSON when available, else ticker_label (e.g. CIK).
+
+    fetch_mdna=False skips the (heavy) MD&A document fetches — used for bulk universe
+    screening, where only the XBRL financials are needed; MD&A is fetched on demand.
     """
     base_dir = Path(output_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -328,8 +368,8 @@ def run_sec_api_fallback(
                 files_written.append(str(out))
 
     filings_count = 0
-    # MD&A: fetch for recent periodic filings from submissions.
-    if sub is not None:
+    # MD&A: fetch for recent periodic filings from submissions (skipped in facts-only mode).
+    if fetch_mdna and sub is not None:
         try:
             from commonsense.edgar.mdna import _cik_to_int, write_mdna_for_filing
             cik_int = _cik_to_int(cik)

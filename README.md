@@ -50,6 +50,50 @@ A private, localized financial intelligence pipeline. CommonSense ingests SEC ED
   These are intended for review and for feeding into local models (we’re working on that integration).
 - **Important behavior:** `run_ticker.py` currently runs `run_analysis_all(DATA_DIR)`, so it recomputes analysis for all companies in `data/parquet/`, not just the ticker passed on the command line.
 
+### 2.1 Financial-health ratios + ratio flux
+
+Cross-statement ratio suite (profitability, efficiency, liquidity, leverage, cash
+flow, per-share) computed from the same wide fact tables → `ratios_financial_health.csv`
+and period-over-period `flux_ratios_financial_health.csv` per company. These feed
+both the Gemini context and the quality score below.
+
+### 2.2 Valuation multiples (price-based)
+
+`src/commonsense/analysis/valuation_multiples.py` joins the latest fiscal-year SEC
+facts with a live market quote (`src/commonsense/market/prices.py`: yfinance primary,
+keyless Yahoo-chart fallback; shares outstanding preferred from SEC facts) to compute
+**P/E, P/S, P/B, EV/EBITDA, EV/EBIT, PEG** plus revenue/earnings CAGRs and FCF →
+`ratios_valuation_multiples.csv` per company.
+
+### 2.3 Composite quality score (`scores.json`)
+
+`src/commonsense/analysis/scoring.py` scores each company 0–100 across four pillars
+(profitability 0.30, growth 0.25, balance-sheet 0.20, cash-conversion 0.25). The
+rubric lives in one data structure (`PILLARS`) that drives **both** the computation
+and a `methodology` block emitted into `scores.json`, so the math and its rendered
+definition can never drift. Verdicts: strong ≥75 · solid ≥60 · watch ≥45 · weak <45.
+`scores.json` is the machine-readable contract consumed by Atlas
+(see `Docs/Atlas_Integration.md`).
+
+### 2.4 Universe screener
+
+`python -m commonsense.screener` scores a whole universe (bundled
+`data/universe/sp500.csv`: symbol, CIK, GICS sector/sub-industry) and ranks it
+cross-sectionally → `data/parquet/screener/picks.json`:
+
+- **Batched prices:** one yfinance `download` per ~100 symbols (not one request per name).
+- **Facts-only ingest** (`fetch_mdna=False`) by CIK, sequential + SEC-throttled;
+  cached names are skipped, so re-runs are incremental. `--no-ingest` re-ranks from
+  cache in ~2 min; a cold full S&P 500 ingest is ~100 min.
+- **Mispricing flag:** quality ≥ 60 AND valuation in the cheapest third of the GICS
+  sector (EV/EBITDA preferred, else P/E, else P/S). `pick_score` blends quality (65%)
+  with sector-relative cheapness (35%).
+- CLI: `--limit N`, `--no-ingest`, `--force`.
+
+MD&A is deliberately **not** fetched during bulk screens; it is pulled on demand per
+company (latest 10-K/10-Q via the cached submissions parquet) when a deeper report
+is opened — see `Docs/Atlas_Integration.md` §3.3.
+
 ### 3. Dashboard and test runner
 
 - **Streamlit dashboard:** Run `./run.sh` to start the app and open the browser. Enter tickers (or CIKs), optionally form types (used only when form discovery returns no forms), and click “Run ingestion.” Results and errors are shown; data lands in `data/parquet/<ticker>/`.
@@ -100,26 +144,38 @@ CommonSense/
 ├── .env.example        # EDGAR_EMAIL, DATA_DIR, optional EDGAR_LOCAL_DATA_DIR
 ├── src/commonsense/
 │   ├── config.py       # EDGAR_EMAIL, DATA_DIR; sets EDGAR_LOCAL_DATA_DIR to data/.edgar
+│   ├── screener.py     # Universe screener: ingest → score → cross-sectional rank → picks.json
 │   ├── edgar/
-│   │   ├── ingestion.py   # run_ingestion(tickers, forms, ...); CIK + form discovery, edgartools + fallback
-│   │   ├── mdna.py        # MD&A extraction (Item 7/2/5) from filing HTML
-│   │   ├── sec_api.py     # ticker_to_cik, fetch_submissions, get_periodic_forms_from_submissions; data.sec.gov fallback
+│   │   ├── ingestion.py   # run_ingestion(tickers, forms, fetch_mdna=...); CIK + form discovery
+│   │   ├── mdna.py        # MD&A extraction (Item 7/2/5) from filing HTML, size-bounded
+│   │   ├── sec_api.py     # ticker_to_cik (+aliases/ticker.txt fallback), submissions, companyfacts
 │   │   └── models.py      # Table name constants
+│   ├── market/
+│   │   └── prices.py    # get_quote (yfinance→Yahoo-chart), get_prices_batch (batched downloads)
 │   ├── analysis/
-│   │   └── common_size_flux.py   # common-size & flux from facts → CSV per company
+│   │   ├── common_size_flux.py    # common-size, flux, financial-health ratios → CSV per company
+│   │   ├── valuation_multiples.py # P/E, P/S, P/B, EV/EBITDA, PEG from facts + live quote
+│   │   └── scoring.py             # PILLARS rubric → quality score + methodology → scores.json
 │   └── dashboard/
 │       └── app.py       # Streamlit UI
 ├── data/
-│   ├── .edgar/         # edgartools cache (default; gitignored)
-│   └── parquet/         # Output root (DATA_DIR)
+│   ├── .edgar/          # edgartools cache (default; gitignored)
+│   ├── universe/
+│   │   └── sp500.csv    # Screener universe: symbol, CIK, GICS sector, sub-industry (tracked)
+│   └── parquet/         # Output root (DATA_DIR; gitignored)
+│       ├── screener/
+│       │   └── picks.json            # Ranked universe (quality + mispricing)
 │       └── <ticker>/    # e.g. AAPL/, MSFT/
 │           ├── {ticker}_sec_facts_*.parquet
-│           ├── *_mdna.txt
-│           ├── common_size_*.csv
-│           ├── flux_*.csv
+│           ├── {ticker}_sec_submissions.parquet
+│           ├── *_mdna.txt            # fetched on demand, not during bulk screens
+│           ├── common_size_*.csv, flux_*.csv
+│           ├── ratios_financial_health.csv, flux_ratios_financial_health.csv
+│           ├── ratios_valuation_multiples.csv
+│           ├── scores.json           # quality score + methodology (Atlas contract)
 │           └── Analysis/
 │               └── *_gemini_analysis_*.md
-└── Docs/                # Charter, troubleshooting, API overview
+└── Docs/                # Charter, research plan, Atlas integration, troubleshooting
 ```
 
 ---
@@ -157,6 +213,14 @@ CommonSense/
   .venv/bin/python run_ticker.py MSFT
   ```
   Run from the project root so `data/.edgar` and `data/parquet` resolve correctly.
+- **Universe screener** (score + rank the S&P 500 → `data/parquet/screener/picks.json`):
+  ```bash
+  PYTHONPATH=src .venv/bin/python -m commonsense.screener               # full run (ingests missing names)
+  PYTHONPATH=src .venv/bin/python -m commonsense.screener --limit 25    # first 25 names
+  PYTHONPATH=src .venv/bin/python -m commonsense.screener --no-ingest   # re-rank from cached facts (~2 min)
+  ```
+  A cold full-universe ingest takes ~100 min (sequential, SEC fair-access); re-runs
+  are incremental because cached facts are skipped.
 
 ---
 
@@ -218,24 +282,45 @@ Risk assessment from the generated report: **Medium-Low** over the next 12 month
 
 ---
 
+## Atlas integration
+
+CommonSense is the fundamentals engine behind the **Picks** tab of Atlas (the local
+life dashboard). Atlas shells into this project's venv and consumes the on-disk
+artifacts — `scores.json` per ticker and `data/parquet/screener/picks.json` — plus
+two on-demand subprocess entry points (single-ticker lookup, MD&A fetch).
+**The full contract, invocation invariants, JSON schemas, and stability rules live
+in [`Docs/Atlas_Integration.md`](Docs/Atlas_Integration.md).** Read it before
+renaming any output path or `scores.json` field.
+
+---
+
 ## Known gaps (highest priority)
 
+- **Industry-specific scoring overlays.** The universal `PILLARS` rubric mis-scores
+  financials/REITs (e.g. banks get penalized on leverage that is structural to the
+  business — JPM scores 22.6). The sector→metric overlay map is specced in
+  `Docs/Research_Plan_Fundamental_Stock_Selection.md` §3 and is the top follow-up.
 - **MD&A extraction quality is improved but not perfect across all historical issuer/form variants.**
-  - Newer filings are generally clean; some older filings may still include residual document artifacts that need further filtering.
+  - Newer filings are generally clean; oversized "Item 7 spans 100+ pages" filers are
+    now size-bounded, but some older filings may still include residual artifacts.
 - **Ticker lookup can fail in some environments.**
-  - Workaround: run by CIK (e.g. `320193` for Apple) and output still lands under ticker folder (`AAPL/`).
+  - Workaround: run by CIK (the universe CSV carries CIKs so the screener already does this).
 
 ---
 
 ## Next focus
 
-- Make MD&A extraction robust for every company/form by improving section start/end targeting and validating against saved raw filings.
-- Eliminate cache-path instability so ticker/CIK runs do not depend on writable `~/.edgar`.
-- Update `run_ticker.py` output to report only the requested ticker/CIK results.
+- Implement the industry overlays (banks/SaaS/REITs/industrials) from the research plan.
+- An investment-strategy filter that re-weights or swaps `PILLARS` (growth / value /
+  income presets) — the data-driven rubric was built so this is a config change.
+- Validate MD&A extraction against saved raw filings for the remaining edge-case issuers.
 
 ---
 
 ## Roadmap (beyond v1)
 
-- **Local models:** We’re working on modifying the local models now so that MD&A, common-size, and flux outputs feed into analyst-style narrative.
+- **Local models:** MD&A, common-size, flux, ratio, and multiples outputs feeding a
+  local analyst-style narrative (Ollama) instead of the cloud Gemini call.
 - Optional context limiting (e.g. last N periods, material variances only) to keep prompts within model context and runtime reasonable.
+- Portfolio-level analytics: fundamentals pick the holdings; price action sets the
+  weights; tax/horizon-aware lot selection minimizes rebalancing costs (Atlas side).

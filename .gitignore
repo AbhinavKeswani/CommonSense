@@ -8,3 +8,6 @@ __pycache__/
 .venv/
 venv/
 .streamlit/
+
+# Local briefing/scratch docs (not source)
+*.pdf

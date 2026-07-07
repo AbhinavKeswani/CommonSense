@@ -13,6 +13,12 @@ from commonsense.edgar.sec_api import (
     _ticker_from_submissions,
 )
 
+_CIK_HINTS = {
+    "GOOG": "1652044",
+    "GOOGL": "1652044",
+    "AAPL": "320193",
+}
+
 
 def run_ingestion(
     tickers: list[str],
@@ -21,8 +27,12 @@ def run_ingestion(
     email: str,
     delay_between_companies: float = 0.3,
     max_filings_per_form: int = 5,
+    fetch_mdna: bool = True,
 ) -> dict[str, Any]:
-    """Ingest SEC data using only SEC JSON APIs + SEC Archives HTML for MD&A."""
+    """Ingest SEC data using only SEC JSON APIs + SEC Archives HTML for MD&A.
+
+    fetch_mdna=False pulls XBRL financials only (fast, for bulk universe screening).
+    """
     if not email.strip():
         return {
             "tickers_processed": 0,
@@ -51,7 +61,11 @@ def run_ingestion(
             cik_str = ticker_to_cik(raw, email)
             cik_int = int(cik_str) if cik_str else None
         if not cik_str and not cik_int:
-            errors.append(f"{ticker}: could not resolve to CIK (ticker not in SEC list?)")
+            hint = _CIK_HINTS.get(ticker)
+            if hint:
+                errors.append(f"{ticker}: could not resolve to CIK (ticker lookup unavailable). Try CIK {hint}.")
+            else:
+                errors.append(f"{ticker}: could not resolve to CIK (ticker lookup unavailable). Try running by CIK.")
             continue
 
         # Fetch submissions to discover which periodic forms this company actually files.
@@ -69,6 +83,7 @@ def run_ingestion(
                 delay_seconds=max(0.1, delay_between_companies * 0.5),
                 forms=forms_to_use,
                 max_filings_per_form=max_filings_per_form,
+                fetch_mdna=fetch_mdna,
             )
             files_written.extend(primary.get("files_written", []))
             filings_count += int(primary.get("filings_count", 0) or 0)

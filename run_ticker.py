@@ -42,7 +42,7 @@ Path(os.environ.get("EDGAR_LOCAL_DATA_DIR", "")).mkdir(parents=True, exist_ok=Tr
 
 from commonsense.config import DATA_DIR, EDGAR_EMAIL, GEMINI_API_KEY
 from commonsense.edgar.ingestion import run_ingestion
-from commonsense.analysis import run_analysis_all
+from commonsense.analysis import run_analysis_all, score_company
 
 # Set to True to run Gemini AI analysis after ingestion (MD&A + common-size + flux → analysis).
 ENABLE_GEMINI_ANALYSIS = True
@@ -98,6 +98,14 @@ Return your full answer in valid Markdown, using clear headings, bullets, and th
           | Metric / Claim | Value from our CSV output | MD&A statement | Match status (Match / Partial / Mismatch) |
 
 """
+
+
+def _fmt(v: object) -> str:
+    """Format a numeric multiple/price for the console, or '—' if missing."""
+    try:
+        return f"{float(v):.1f}" if v is not None else "—"
+    except (TypeError, ValueError):
+        return "—"
 
 
 def _collect_analysis_inputs(company_dir: Path) -> tuple[list[Path], list[Path], list[Path], list[Path], list[Path]]:
@@ -224,6 +232,24 @@ def main() -> None:
     if analysis["errors"]:
         for e in analysis["errors"]:
             print(f"  Error: {e}")
+
+    # Valuation multiples (price-based) + composite quality score → ratios_valuation_multiples.csv + scores.json
+    print("\nComputing valuation multiples + quality score...")
+    try:
+        score = score_company(ticker, DATA_DIR, write_json=True)
+        mult = score.get("multiples", {})
+        print(f"  Quality score: {score.get('quality_score')} ({score.get('verdict')})")
+        print(
+            "  P/E={pe}  P/S={ps}  P/B={pb}  EV/EBITDA={ev}  PEG={peg}  price={px} ({src})".format(
+                pe=_fmt(mult.get("pe")), ps=_fmt(mult.get("ps")), pb=_fmt(mult.get("pb")),
+                ev=_fmt(mult.get("ev_ebitda")), peg=_fmt(mult.get("peg")),
+                px=_fmt(mult.get("price")), src=mult.get("price_source") or "n/a",
+            )
+        )
+        if score.get("flags"):
+            print(f"  Flags: {', '.join(score['flags'])}")
+    except Exception as e:
+        print(f"  Scoring error: {e}", file=sys.stderr)
 
     # Show where data landed: prefer ticker dir; if input was CIK, resolve by metadata written this run.
     company_dir = DATA_DIR / ticker
