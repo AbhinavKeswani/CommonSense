@@ -217,24 +217,58 @@ def _companyfacts_to_dataframes(data: dict[str, Any]) -> tuple[pd.DataFrame, pd.
     rows_balance: list[dict] = []
     rows_cash: list[dict] = []
 
-    # Common US-GAAP tags by statement type (subset)
-    INCOME_TAGS = {"Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "NetIncomeLoss", "GrossProfit", "OperatingIncomeLoss", "CostOfRevenue", "OperatingExpenses", "ResearchAndDevelopmentExpense", "SellingGeneralAndAdministrativeExpense"}
-    BALANCE_TAGS = {
-        "Assets",
-        "Liabilities",
-        "StockholdersEquity",
-        "LiabilitiesAndStockholdersEquity",
-        "CashAndCashEquivalentsAtCarryingValue",
-        "AccountsReceivableNetCurrent",
-        "InventoryNet",
-        "PropertyPlantAndEquipmentNet",
-        "AccountsPayableCurrent",
-        "LongTermDebt",
-        "ShortTermDebt",
-        "CommonStockSharesOutstanding",
-        "EntityCommonStockSharesOutstanding",
+    # Common US-GAAP tags by statement type. These are ALLOWLISTS: a concept not
+    # listed here is dropped at ingestion and can never reach the analysis layer.
+    # (EV/EBITDA was null for 96% of the universe because no D&A tag was listed —
+    # keep these sets generous.)
+    INCOME_TAGS = {
+        "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "SalesRevenueNet", "SalesRevenueGoodsNet", "SalesRevenueServicesNet",
+        "NetIncomeLoss", "ProfitLoss", "GrossProfit", "OperatingIncomeLoss",
+        "CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold",
+        "OperatingExpenses", "ResearchAndDevelopmentExpense",
+        "SellingGeneralAndAdministrativeExpense",
+        "IncomeTaxExpenseBenefit", "InterestExpense", "InterestExpenseNonoperating",
+        "InterestIncomeExpenseNet", "InterestAndDebtExpense",
+        "EarningsPerShareBasic", "EarningsPerShareDiluted",
+        "WeightedAverageNumberOfSharesOutstandingBasic",
+        "WeightedAverageNumberOfDilutedSharesOutstanding",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
     }
-    CASH_TAGS = {"NetCashProvidedByUsedInOperatingActivities", "NetCashProvidedByUsedInInvestingActivities", "NetCashProvidedByUsedInFinancingActivities", "CashAndCashEquivalentsPeriodIncreaseDecrease"}
+    BALANCE_TAGS = {
+        "Assets", "AssetsCurrent",
+        "Liabilities", "LiabilitiesCurrent",
+        "StockholdersEquity",
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+        "LiabilitiesAndStockholdersEquity", "MinorityInterest",
+        "CashAndCashEquivalentsAtCarryingValue",
+        "CashCashEquivalentsAndShortTermInvestments", "ShortTermInvestments",
+        "AccountsReceivableNetCurrent", "InventoryNet",
+        "PropertyPlantAndEquipmentNet", "AccountsPayableCurrent",
+        "LongTermDebt", "LongTermDebtNoncurrent", "LongTermDebtCurrent",
+        "ShortTermDebt", "ShortTermBorrowings", "DebtCurrent", "CommercialPaper",
+        "OperatingLeaseLiabilityNoncurrent", "FinanceLeaseLiabilityNoncurrent",
+        "Goodwill", "IntangibleAssetsNetExcludingGoodwill",
+        "RetainedEarningsAccumulatedDeficit",
+        "CommonStockSharesOutstanding", "EntityCommonStockSharesOutstanding",
+    }
+    CASH_TAGS = {
+        "NetCashProvidedByUsedInOperatingActivities",
+        "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+        "NetCashProvidedByUsedInInvestingActivities",
+        "NetCashProvidedByUsedInFinancingActivities",
+        "CashAndCashEquivalentsPeriodIncreaseDecrease",
+        # D&A family — required for EBITDA.
+        "DepreciationDepletionAndAmortization", "DepreciationAndAmortization",
+        "Depreciation", "AmortizationOfIntangibleAssets",
+        "DepreciationAmortizationAndAccretionNet",
+        # Capex family — required for FCF.
+        "PaymentsToAcquirePropertyPlantAndEquipment", "CapitalExpenditures",
+        "PaymentsToAcquireProductiveAssets",
+        # Capital returns (used by narrative checks / future overlays).
+        "PaymentsOfDividends", "PaymentsOfDividendsCommonStock",
+        "PaymentsForRepurchaseOfCommonStock", "ShareBasedCompensation",
+    }
 
     def emit(concept: str, unit: str, facts_list: list, target: list[dict], tag: str):
         for f in facts_list:
