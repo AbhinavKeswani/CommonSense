@@ -42,6 +42,22 @@ _DA_NAMES = frozenset({
     "amortizationofintangibleassets",
 })
 
+# EBIT derivation chain for filers that don't tag an operating-income subtotal
+# (e.g. KLAC stopped tagging OperatingIncomeLoss in 2015).
+_GROSS_PROFIT_NAMES_VM = frozenset({"grossprofit"})
+_OPEX_NAMES = frozenset({"operatingexpenses"})
+_PRETAX_NAMES = frozenset({
+    "incomelossfromcontinuingoperationsbeforeincometaxesextraordinaryitemsnoncontrollinginterest",
+    "incomelossfromcontinuingoperationsbeforeincometaxesminorityinterestandincomelossfromequitymethodinvestments",
+})
+_TAX_NAMES = frozenset({"incometaxexpensebenefit"})
+_INTEREST_NAMES = frozenset({"interestexpense", "interestexpensenonoperating", "interestanddebtexpense"})
+
+# A flow series older than this (vs. the company's latest revenue period) is
+# treated as missing — a filer that stopped tagging a concept must not
+# contribute a years-stale number to a current multiple.
+_MAX_STALENESS_DAYS = 550
+
 _ANNUAL_FORMS = {"10-K", "10-K/A", "20-F", "20-F/A", "40-F"}
 
 
@@ -96,6 +112,53 @@ def _latest_any(long_df: pd.DataFrame | None, names: frozenset[str]) -> float | 
     return float(df["value"].iloc[-1])
 
 
+def _latest_fresh(series: pd.Series, ref_end: pd.Timestamp | None) -> float | None:
+    """Latest value of an annual series, or None if it's stale vs. ref_end."""
+    if series is None or series.empty:
+        return None
+    if ref_end is not None and (ref_end - series.index[-1]).days > _MAX_STALENESS_DAYS:
+        return None
+    return float(series.iloc[-1])
+
+
+def _derive_ebit(inc: pd.DataFrame | None, ref_end: pd.Timestamp | None) -> float | None:
+    """EBIT with fallbacks, freshness-guarded at every step:
+
+    1. OperatingIncomeLoss (direct tag)
+    2. GrossProfit − OperatingExpenses
+    3. Pretax income + interest expense
+    4. Net income + tax + interest expense
+    """
+    direct = _latest_fresh(_annual_series(inc, _OPERATING_INCOME_NAMES), ref_end)
+    if direct is not None:
+        return direct
+    gp_s = _annual_series(inc, _GROSS_PROFIT_NAMES_VM)
+    opex_s = _annual_series(inc, _OPEX_NAMES)
+    if not gp_s.empty and not opex_s.empty:
+        common = gp_s.index.intersection(opex_s.index)
+        if len(common) and (ref_end is None or (ref_end - common[-1]).days <= _MAX_STALENESS_DAYS):
+            return float(gp_s.loc[common[-1]] - opex_s.loc[common[-1]])
+    pretax = _latest_fresh(_annual_series(inc, _PRETAX_NAMES), ref_end)
+    interest = _latest_fresh(_annual_series(inc, _INTEREST_NAMES), ref_end)
+    if pretax is not None:
+        return pretax + (interest or 0.0)
+    net = _latest_fresh(_annual_series(inc, _NET_INCOME_NAMES), ref_end)
+    tax = _latest_fresh(_annual_series(inc, _TAX_NAMES), ref_end)
+    if net is not None and tax is not None:
+        return net + tax + (interest or 0.0)
+    return None
+
+
+def _ebitda_from_yfinance(symbol: str) -> float | None:
+    """Trailing EBITDA from Yahoo — fallback only, when SEC D&A can't be classified."""
+    try:
+        import yfinance as yf
+        v = (yf.Ticker(symbol).info or {}).get("ebitda")
+        return float(v) if v else None
+    except Exception:  # noqa: BLE001 - fallback must never break the SEC path
+        return None
+
+
 def _cagr(series: pd.Series) -> float | None:
     """Annualized growth (%) between first and last positive annual points."""
     s = series.dropna()
@@ -126,13 +189,16 @@ def compute_multiples(
 
     revenue_s = _annual_series(inc, _REVENUE_NAMES)
     net_income_s = _annual_series(inc, _NET_INCOME_NAMES)
-    ebit = _latest(_annual_series(inc, _OPERATING_INCOME_NAMES))
-    d_a = _latest(_annual_series(cash, _DA_NAMES))
-    cfo = _latest(_annual_series(cash, _CFO_NAMES))
-    capex = _latest(_annual_series(cash, _CAPEX_NAMES))
+    # Revenue is the always-tagged reference period: any flow whose latest point
+    # is much older than this is a discontinued tag, not current data.
+    ref_end = revenue_s.index[-1] if not revenue_s.empty else None
+    ebit = _derive_ebit(inc, ref_end)
+    d_a = _latest_fresh(_annual_series(cash, _DA_NAMES), ref_end)
+    cfo = _latest_fresh(_annual_series(cash, _CFO_NAMES), ref_end)
+    capex = _latest_fresh(_annual_series(cash, _CAPEX_NAMES), ref_end)
 
     revenue = _latest(revenue_s)
-    net_income = _latest(net_income_s)
+    net_income = _latest_fresh(net_income_s, ref_end)
     equity = _latest_any(bal, _EQUITY_NAMES)
     cash_eq = _latest_any(bal, _CASH_EQ_NAMES)
     long_debt = _latest_any(bal, _LONG_DEBT_NAMES) or 0.0
@@ -141,13 +207,24 @@ def compute_multiples(
     shares = _latest_any(bal, _SHARES_NAMES)
 
     # Live quote (price + market cap), preferring the SEC-derived share count.
-    quote = get_quote(company_ticker, shares_outstanding=shares) if price is None else None
+    # Fetch the quote even when a batch price override is supplied if we still
+    # need a share count — otherwise market cap (and every multiple) dies here.
+    quote = None
+    if price is None or shares is None:
+        quote = get_quote(company_ticker, shares_outstanding=shares)
     px = price if price is not None else (quote.price if quote else None)
     if shares is None and quote is not None:
         shares = quote.shares_outstanding
     market_cap = (px * shares) if (px is not None and shares) else (quote.market_cap if quote else None)
 
     ebitda = (ebit + d_a) if (ebit is not None and d_a is not None) else None
+    ebitda_source = "sec" if ebitda is not None else ""
+    if ebitda is None:
+        # Last resort: Yahoo's own trailing EBITDA. SEC facts stay the primary
+        # source; this only fills filers whose D&A tag we still can't classify.
+        ebitda = _ebitda_from_yfinance(company_ticker)
+        if ebitda is not None:
+            ebitda_source = "yfinance"
     ev = None
     if market_cap is not None:
         ev = market_cap + total_debt - (cash_eq or 0.0)
@@ -192,6 +269,7 @@ def compute_multiples(
         "total_debt": total_debt,
         "cash": cash_eq,
         "ebitda": ebitda,
+        "ebitda_source": ebitda_source,
         "price_source": (quote.source if quote else ("override" if price is not None else "")),
     }
 
